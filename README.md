@@ -1,7 +1,7 @@
 # ndviewer
-ND viewer based on [ndv](https://github.com/pyapp-kit/ndv)
+ND viewer based on [ndv](https://github.com/pyapp-kit/ndv) and napari
 
-## Installation
+## Installation for ndv-based viewer
 ```
 conda create -n ndv python=3.12
 conda activate ndv

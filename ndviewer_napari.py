@@ -380,6 +380,33 @@ folder_name = data['folder_name']
 # Get dimensions
 dims = metadata['dimensions']
 file_map = metadata['file_map']
+acq_params = metadata['acquisition_parameters']
+
+# Calculate pixel size in microns
+pixel_size_um = None
+z_step_um = None
+
+if acq_params:
+    # Get pixel size from sensor pixel size and objective magnification
+    if 'sensor_pixel_size_um' in acq_params and 'objective' in acq_params and 'magnification' in acq_params['objective']:
+        sensor_pixel_size = acq_params['sensor_pixel_size_um']
+        magnification = acq_params['objective']['magnification']
+        pixel_size_um = sensor_pixel_size / magnification
+        print(f"Calculated pixel size: {pixel_size_um:.3f} µm")
+    
+    # Get Z step size
+    if 'dz(um)' in acq_params:
+        z_step_um = acq_params['dz(um)']
+        print(f"Z step size: {z_step_um} µm")
+
+# Default values if not found in parameters
+if pixel_size_um is None:
+    pixel_size_um = 1.0
+    print("Warning: Using default pixel size of 1.0 µm")
+    
+if z_step_um is None:
+    z_step_um = 1.0
+    print("Warning: Using default Z step size of 1.0 µm")
 
 # Create a function that loads TIFF files on demand
 @dask.delayed
@@ -424,6 +451,12 @@ channel_names = metadata['channels']
 region_names = metadata['regions']
 fov_names = metadata['fovs']
 
+# Calculate scale for each dimension
+# [time, region, fov, z, y, x]
+# For time, region, and fov, we use 1.0 as they're indices
+# For z, y, x we use the physical dimensions
+scale = [1.0, 1.0, 1.0, z_step_um, pixel_size_um, pixel_size_um]
+
 # Add each channel as a separate layer
 for c in range(dims['channel']):
     # For each channel, we keep all other dimensions
@@ -433,11 +466,11 @@ for c in range(dims['channel']):
     # Create a meaningful name for the layer
     layer_name = f"Channel: {channel_names[c]}"
     
-    # Add to viewer with appropriate dimension labels
+    # Add to viewer with appropriate dimension labels and scale
     viewer.add_image(
         channel_data,
         name=layer_name,
-        scale=[1, 1, 1, 1, 1, 1],  # Adjust scale if needed
+        scale=scale,  # Apply physical scale
         blending='additive',
         colormap='gray',
         # Define dimension names for sliders
@@ -450,6 +483,11 @@ for c in range(dims['channel']):
 
 # Set dimension labels for the sliders
 viewer.dims.axis_labels = ['Time', 'Region', 'FOV', 'Z', 'Y', 'X']
+
+# Add physical units to the dimension labels
+if z_step_um is not None and pixel_size_um is not None:
+    viewer.scale_bar.unit = 'µm'
+    viewer.scale_bar.visible = True
 
 # Optional: Add text overlays for region and FOV names
 @viewer.dims.events.current_step.connect

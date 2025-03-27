@@ -5,5 +5,5 @@ ND viewer based on [ndv](https://github.com/pyapp-kit/ndv) and napari
 ```
 conda create -n ndv python=3.12
 conda activate ndv
-pip install "ndv[vispy,pyqt]"
+pip install "ndv[vispy,pyqt]" tifffile zarr=2.18.4
 ```

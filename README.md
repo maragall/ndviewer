@@ -3,6 +3,9 @@ ND viewer based on [ndv](https://github.com/pyapp-kit/ndv) and napari
 
 ## Installation for ndv-based viewer
 ```
-conda create -n ndv python=3.12
-conda activate ndv
-pip install "ndv[vispy,pyqt]" tifffile zarr pandas numpy numcodecs==0.15.1 dask
+chmod +x setup.sh
+./setup.sh
+```
+## Create Desktop Shortcut
+```
+python create_desktop_shortcut.py

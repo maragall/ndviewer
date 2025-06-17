@@ -14,6 +14,13 @@ import pickle
 from PyQt6.QtWidgets import QApplication, QFileDialog, QDialog, QVBoxLayout, QPushButton, QLabel
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
 
+# Import the downsampler module
+try:
+    from downsampler import DownsampledNavigator
+except ImportError:
+    print("Warning: downsampler module not found. Navigator will be disabled.")
+    DownsampledNavigator = None
+
 def create_tiff_zarr_map(input_dir, coordinate_csv=None, acquisition_params_json=None, configurations_xml=None):
     """
     Create a virtual mapping of TIFF files to a Zarr store structure without loading data into RAM.
@@ -368,6 +375,18 @@ import dask.array as da
 import dask
 import tifffile
 import numpy as np
+from napari.layers import Image
+from vispy.scene.visuals import Rectangle
+from vispy.scene import PanZoomCamera
+
+# Try to import downsampler
+try:
+    sys.path.insert(0, os.path.dirname('""" + os.path.abspath(__file__) + """'))
+    from downsampler import DownsampledNavigator
+    NAVIGATOR_AVAILABLE = True
+except ImportError:
+    print("Warning: Navigator module not available")
+    NAVIGATOR_AVAILABLE = False
 
 # Load the metadata from the temp file
 with open(sys.argv[1], 'rb') as f:
@@ -488,6 +507,153 @@ viewer.dims.axis_labels = ['Time', 'Region', 'FOV', 'Z', 'Y', 'X']
 if z_step_um is not None and pixel_size_um is not None:
     viewer.scale_bar.unit = 'µm'
     viewer.scale_bar.visible = True
+
+# ===== ADD NAVIGATOR FUNCTIONALITY =====
+if NAVIGATOR_AVAILABLE and dims['region'] > 0 and dims['fov'] > 0:
+    print("Creating navigator overlay...")
+    
+    try:
+        # Create navigator with progress callback
+        def progress_callback(percent, message):
+            print(f"Navigator: {percent}% - {message}")
+        
+        navigator = DownsampledNavigator(
+            directory, 
+            tile_size=50,
+            cache_enabled=True,
+            progress_callback=progress_callback
+        )
+        
+        # Create mosaic for current timepoint
+        current_time = viewer.dims.current_step[0] if viewer.dims.current_step else 0
+        mosaic_array, nav_metadata = navigator.create_mosaic(current_time)
+        
+        # Add navigator as an overlay layer
+        nav_layer = viewer.add_image(
+            mosaic_array,
+            name='Navigator',
+            opacity=0.8,
+            colormap='gray',
+            visible=True,
+            scale=(1, 1),  # Navigator has its own coordinate system
+            translate=(0, 0),
+            metadata=nav_metadata
+        )
+        
+        # Position navigator in top-right corner
+        # Use the navigator layer's shape to determine positioning
+        nav_height, nav_width = mosaic_array.shape
+        # Position it in the top-right area (coordinates will be in data space)
+        nav_layer.translate = (0, 0)  # Keep at origin for now
+        
+        # Create a red box overlay for current view
+        # Instead of using vispy directly, use napari shapes layer for the overlay
+        nav_box_layer = None
+        
+        # Function to update navigator box based on current view
+        def update_navigator_box():
+            global nav_box_layer
+            try:
+                # Get current FOV and region from sliders
+                current_step = viewer.dims.current_step
+                if len(current_step) >= 3:
+                    region_idx = current_step[1]
+                    fov_idx = current_step[2]
+                    
+                    # Get the actual region and fov names
+                    if region_idx < len(region_names) and fov_idx < len(fov_names):
+                        region_name = region_names[region_idx]
+                        fov_name = fov_names[fov_idx]
+                        
+                        # Find this FOV in the navigator metadata
+                        fov_grid = nav_metadata['fov_grid']
+                        tile_size = nav_metadata['tile_size']
+                        
+                        # Find the grid position of this FOV
+                        for (row, col), (nav_region, nav_fov) in fov_grid.items():
+                            if nav_region == region_name and nav_fov == fov_name:
+                                # Calculate pixel position in navigator
+                                nav_x = col * tile_size + tile_size // 2
+                                nav_y = row * tile_size + tile_size // 2
+                                
+                                # Create a rectangle shape for the box
+                                box_size = tile_size * 0.8
+                                box_coords = [
+                                    [nav_y - box_size//2, nav_x - box_size//2],
+                                    [nav_y - box_size//2, nav_x + box_size//2],
+                                    [nav_y + box_size//2, nav_x + box_size//2],
+                                    [nav_y + box_size//2, nav_x - box_size//2]
+                                ]
+                                
+                                # Remove existing box layer if it exists
+                                if nav_box_layer is not None and nav_box_layer in viewer.layers:
+                                    viewer.layers.remove(nav_box_layer)
+                                
+                                # Add new box as a shapes layer
+                                nav_box_layer = viewer.add_shapes(
+                                    [box_coords],
+                                    shape_type='rectangle',
+                                    edge_color='red',
+                                    face_color='transparent',
+                                    edge_width=2,
+                                    name='Navigator Box',
+                                    opacity=0.8
+                                )
+                                
+                                # Make it non-interactive
+                                nav_box_layer.interactive = False
+                                break
+            except Exception as e:
+                print(f"Error updating navigator box: {e}")
+        
+        # Connect the update function to dimension changes
+        viewer.dims.events.current_step.connect(update_navigator_box)
+        
+        # Also update on camera changes (pan/zoom)
+        viewer.camera.events.zoom.connect(update_navigator_box)
+        viewer.camera.events.center.connect(update_navigator_box)
+        
+        # Initial update
+        update_navigator_box()
+        
+        # Make navigator non-interactive to prevent accidental moves
+        nav_layer.interactive = False
+        
+        # Function to handle clicks on navigator
+        @nav_layer.mouse_drag_callbacks.append
+        def on_navigator_click(layer, event):
+            if event.button == 1:  # Left click
+                # Get click position relative to navigator
+                pos = event.position[:2]  # Get 2D position
+                nav_pos = pos - nav_layer.translate
+                
+                # Convert to grid coordinates
+                tile_size = nav_metadata['tile_size']
+                col = int(nav_pos[0] / tile_size)
+                row = int(nav_pos[1] / tile_size)
+                
+                # Find the corresponding FOV
+                fov_grid = nav_metadata['fov_grid']
+                if (row, col) in fov_grid:
+                    region_name, fov_num = fov_grid[(row, col)]
+                    
+                    # Find indices
+                    if region_name in region_names and fov_num in fov_names:
+                        region_idx = region_names.index(region_name)
+                        fov_idx = fov_names.index(fov_num)
+                        
+                        # Update viewer dimensions
+                        current = list(viewer.dims.current_step)
+                        current[1] = region_idx
+                        current[2] = fov_idx
+                        viewer.dims.current_step = current
+        
+        print("Navigator overlay created successfully!")
+        
+    except Exception as e:
+        print(f"Failed to create navigator: {e}")
+        import traceback
+        traceback.print_exc()
 
 # Optional: Add text overlays for region and FOV names
 @viewer.dims.events.current_step.connect

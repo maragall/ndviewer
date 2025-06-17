@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import pickle
 from PyQt6.QtWidgets import QApplication, QFileDialog, QDialog, QVBoxLayout, QPushButton, QLabel
-from PyQt6.QtCore import QObject, pyqtSignal, QThread
+from PyQt6.QtCore import QObject, pyqtSignal, QThread, Qt
 
 # Import the downsampler module
 try:
@@ -338,26 +338,40 @@ class DirectorySelector(QDialog):
         
         layout = QVBoxLayout()
         
-        self.label = QLabel('Please select the directory containing your acquisition data')
+        self.label = QLabel('Drag and drop your acquisition directory here')
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label.setStyleSheet("""
+            QLabel {
+                border: 2px dashed #aaa;
+                border-radius: 5px;
+                padding: 20px;
+                background-color: #f0f0f0;
+            }
+        """)
         layout.addWidget(self.label)
-        
-        self.browse_button = QPushButton('Browse...')
-        self.browse_button.clicked.connect(self.browse_directory)
-        layout.addWidget(self.browse_button)
         
         self.setLayout(layout)
         
-    def browse_directory(self):
-        directory = QFileDialog.getExistingDirectory(self, 'Select Acquisition Directory')
-        if directory:
-            folder_name = os.path.basename(os.path.normpath(directory))
-            self.label.setText(f'Loading: {folder_name}')
-            
-            # Create worker thread
-            self.worker = Worker(directory)
-            self.worker.finished.connect(self.launch_ndv)
-            self.worker.error.connect(self.handle_error)
-            self.worker.start()
+        # Enable drag and drop
+        self.setAcceptDrops(True)
+    
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+    
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls:
+            directory = urls[0].toLocalFile()
+            if os.path.isdir(directory):
+                folder_name = os.path.basename(os.path.normpath(directory))
+                self.label.setText(f'Loading: {folder_name}')
+                
+                # Create worker thread
+                self.worker = Worker(directory)
+                self.worker.finished.connect(self.launch_ndv)
+                self.worker.error.connect(self.handle_error)
+                self.worker.start()
     
     def launch_ndv(self, temp_file, folder_name):
         self.label.setText(f'Opened: {folder_name}')

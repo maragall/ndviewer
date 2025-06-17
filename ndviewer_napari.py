@@ -532,19 +532,66 @@ if NAVIGATOR_AVAILABLE and dims['region'] > 0 and dims['fov'] > 0:
         nav_layer = viewer.add_image(
             mosaic_array,
             name='Navigator',
-            opacity=0.8,
+            opacity=1.0,  # Fully opaque, no translucency
             colormap='gray',
             visible=True,
             scale=(1, 1),  # Navigator has its own coordinate system
             translate=(0, 0),
-            metadata=nav_metadata
+            metadata=nav_metadata,
+            contrast_limits=(0, 255),  # Full contrast range for brightness
+            gamma=0.8  # Lower gamma for brighter appearance
         )
         
-        # Position navigator in top-right corner
-        # Use the navigator layer's shape to determine positioning
-        nav_height, nav_width = mosaic_array.shape
-        # Position it in the top-right area (coordinates will be in data space)
-        nav_layer.translate = (0, 0)  # Keep at origin for now
+        # Position navigator to the side of the main data, not overlapping
+        # Calculate offset to place navigator to the right side of the main data
+        main_data_width = dims['x']  # Width of individual tiles
+        main_data_height = dims['y']  # Height of individual tiles
+        
+        # Position navigator to the right side with some padding
+        nav_offset_x = main_data_width + 200  # 200 pixel padding
+        nav_offset_y = 0  # Keep at same Y level
+        
+        nav_layer.translate = (nav_offset_y, nav_offset_x)
+        
+        # Make navigator interactive for clicking
+        nav_layer.interactive = True
+        
+        # Function to handle clicks on navigator
+        @nav_layer.mouse_drag_callbacks.append
+        def on_navigator_click(layer, event):
+            if event.button == 1:  # Left click
+                # Get click position in the navigator layer's coordinate system
+                pos = event.position
+                if len(pos) >= 2:
+                    # The position is in the navigator's coordinate system
+                    click_y, click_x = pos[-2], pos[-1]  # Get Y, X coordinates
+                    
+                    # Subtract the navigator's offset to get position relative to navigator image
+                    click_x -= nav_offset_x
+                    click_y -= nav_offset_y
+                    
+                    # Convert to grid coordinates
+                    tile_size = nav_metadata['tile_size']
+                    col = int(click_x / tile_size)
+                    row = int(click_y / tile_size)
+                    
+                    # Find the corresponding FOV
+                    fov_grid = nav_metadata['fov_grid']
+                    if (row, col) in fov_grid:
+                        region_name, fov_num = fov_grid[(row, col)]
+                        
+                        # Find indices in the main viewer
+                        if region_name in region_names and fov_num in fov_names:
+                            region_idx = region_names.index(region_name)
+                            fov_idx = fov_names.index(fov_num)
+                            
+                            # Update viewer dimensions to jump to this FOV
+                            current = list(viewer.dims.current_step)
+                            if len(current) >= 3:
+                                current[1] = region_idx  # Region dimension
+                                current[2] = fov_idx     # FOV dimension
+                                viewer.dims.current_step = current
+                                print(f"Jumped to Region: {region_name}, FOV: {fov_num}")
         
         # Create a red box overlay for current view
         # Instead of using vispy directly, use napari shapes layer for the overlay
@@ -572,9 +619,13 @@ if NAVIGATOR_AVAILABLE and dims['region'] > 0 and dims['fov'] > 0:
                         # Find the grid position of this FOV
                         for (row, col), (nav_region, nav_fov) in fov_grid.items():
                             if nav_region == region_name and nav_fov == fov_name:
-                                # Calculate pixel position in navigator
+                                # Calculate pixel position in navigator (relative to navigator's coordinate system)
                                 nav_x = col * tile_size + tile_size // 2
                                 nav_y = row * tile_size + tile_size // 2
+                                
+                                # Account for navigator's translation offset
+                                nav_x += nav_offset_x
+                                nav_y += nav_offset_y
                                 
                                 # Create a rectangle shape for the box
                                 box_size = tile_size * 0.8
@@ -600,8 +651,32 @@ if NAVIGATOR_AVAILABLE and dims['region'] > 0 and dims['fov'] > 0:
                                     opacity=0.8
                                 )
                                 
-                                # Make it non-interactive
+                                # Make the red box non-interactive and hide from layer list
                                 nav_box_layer.interactive = False
+                                nav_box_layer.visible = True
+                                
+                                # Additional properties to minimize user interaction
+                                nav_box_layer.editable = False
+                                nav_box_layer.mouse_pan = False
+                                nav_box_layer.mouse_zoom = False
+                                
+                                # Try to hide it from layer controls (this might not work in all napari versions)
+                                try:
+                                    nav_box_layer._layer_controls_visible = False
+                                except:
+                                    pass
+                                
+                                # Force the navigator box to the very top (highest index = top layer)
+                                # Move it to the top AFTER all properties are set
+                                current_index = viewer.layers.index(nav_box_layer)
+                                viewer.layers.move(current_index, len(viewer.layers) - 1)
+                                
+                                # Force selection back to navigator layer to prevent box selection
+                                try:
+                                    viewer.layers.selection.active = nav_layer
+                                except:
+                                    pass  # In case there's an issue with selection
+                                
                                 break
             except Exception as e:
                 print(f"Error updating navigator box: {e}")
@@ -616,37 +691,30 @@ if NAVIGATOR_AVAILABLE and dims['region'] > 0 and dims['fov'] > 0:
         # Initial update
         update_navigator_box()
         
-        # Make navigator non-interactive to prevent accidental moves
-        nav_layer.interactive = False
+        # Add layer selection event handler to prevent navigator box selection
+        @viewer.layers.selection.events.active.connect
+        def on_layer_selection_changed(event):
+            # If navigator box is selected, switch back to navigator
+            if (hasattr(event, 'value') and event.value is not None and 
+                hasattr(event.value, 'name') and event.value.name == 'Navigator Box'):
+                try:
+                    viewer.layers.selection.active = nav_layer
+                except:
+                    pass
         
-        # Function to handle clicks on navigator
-        @nav_layer.mouse_drag_callbacks.append
-        def on_navigator_click(layer, event):
-            if event.button == 1:  # Left click
-                # Get click position relative to navigator
-                pos = event.position[:2]  # Get 2D position
-                nav_pos = pos - nav_layer.translate
-                
-                # Convert to grid coordinates
-                tile_size = nav_metadata['tile_size']
-                col = int(nav_pos[0] / tile_size)
-                row = int(nav_pos[1] / tile_size)
-                
-                # Find the corresponding FOV
-                fov_grid = nav_metadata['fov_grid']
-                if (row, col) in fov_grid:
-                    region_name, fov_num = fov_grid[(row, col)]
-                    
-                    # Find indices
-                    if region_name in region_names and fov_num in fov_names:
-                        region_idx = region_names.index(region_name)
-                        fov_idx = fov_names.index(fov_num)
-                        
-                        # Update viewer dimensions
-                        current = list(viewer.dims.current_step)
-                        current[1] = region_idx
-                        current[2] = fov_idx
-                        viewer.dims.current_step = current
+        # Add event listener to keep navigator box on top when new layers are added
+        @viewer.layers.events.inserted.connect
+        def on_layer_inserted(event):
+            # Keep navigator box on top whenever a new layer is added
+            global nav_box_layer
+            if nav_box_layer is not None and nav_box_layer in viewer.layers:
+                try:
+                    current_index = viewer.layers.index(nav_box_layer)
+                    top_index = len(viewer.layers) - 1
+                    if current_index != top_index:  # If not already at top
+                        viewer.layers.move(current_index, top_index)
+                except:
+                    pass
         
         print("Navigator overlay created successfully!")
         

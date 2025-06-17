@@ -319,11 +319,18 @@ class DownsampledNavigator:
             
         # Convert to 8-bit
         if best_image.dtype == np.uint16:
-            img_8bit = (best_image >> 8).astype(np.uint8)
+            # Use a more aggressive conversion for brighter images
+            img_8bit = (best_image >> 6).astype(np.uint8)  # Shift less to keep more brightness
+            # Apply additional brightness boost
+            img_8bit = np.clip(img_8bit * 1.5, 0, 255).astype(np.uint8)
         else:
             img_min, img_max = best_image.min(), best_image.max()
             if img_max > img_min:
-                img_8bit = ((best_image - img_min) / (img_max - img_min) * 255).astype(np.uint8)
+                # Normalize and apply brightness boost
+                normalized = (best_image - img_min) / (img_max - img_min)
+                # Apply gamma correction for brighter appearance
+                gamma_corrected = np.power(normalized, 0.7)  # Gamma < 1 for brighter
+                img_8bit = (gamma_corrected * 255).astype(np.uint8)
             else:
                 img_8bit = np.zeros_like(best_image, dtype=np.uint8)
         

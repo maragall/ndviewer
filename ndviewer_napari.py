@@ -1,675 +1,867 @@
 import os
-import glob
-import h5py
-import numpy as np
-import tifffile
-import matplotlib.pyplot as plt
-import pandas as pd
-from scipy.stats import ttest_ind
-from skimage.transform import resize
-from tqdm import tqdm  # progress bar
 import re
-import torch
+import json
+import pandas as pd
+import numpy as np
+import zarr
+from glob import glob
+import xml.etree.ElementTree as ET
+import napari
+import sys
+import subprocess
+import tempfile
+import pickle
+from PyQt6.QtWidgets import QApplication, QFileDialog, QDialog, QVBoxLayout, QPushButton, QLabel
+from PyQt6.QtCore import QObject, pyqtSignal, QThread, Qt
 
-# --- Import Cellpose libraries ---
-from cellpose import models, plot
+# Import the downsampler module
+try:
+    from downsampler import DownsampledNavigator
+    NAVIGATOR_AVAILABLE = True
+    print("Successfully imported downsampler module")
+except ImportError as e:
+    print(f"Warning: downsampler module not found: {e}")
+    NAVIGATOR_AVAILABLE = False
 
-
-# Pattern for TIFF files: {region}_{fov}_{z}_Fluorescence_{wavelength}_nm_Ex.tiff
-TIFF_PATTERN = re.compile(
-    r"([^_]+)_(\d+)_(\d+)_Fluorescence_(\d+)_nm_Ex\.tiff?", re.IGNORECASE
-)
-
-##############################
-# 1. Z-Max Projection Function (Adapted for TIFF)
-##############################
-def zmax_projection(input_folder):
+def create_tiff_zarr_map(input_dir, coordinate_csv=None, acquisition_params_json=None, configurations_xml=None):
     """
-    Process all acquisition folders (containing timepoint subdirectories),
-    and generate a z-max projection across all timepoints for each FOV.
+    Create a virtual mapping of TIFF files to a Zarr store structure without loading data into RAM.
+    Returns a dictionary with metadata and a file map.
     
-    The resulting TIFF images are saved in a subfolder named 'zmax'.
-    """
-    # Create output folder for zmax projections
-    zmax_folder = os.path.join(input_folder, "zmax")
-    os.makedirs(zmax_folder, exist_ok=True)
-    
-    # Get timepoint directories
-    timepoint_dirs = sorted([d for d in os.listdir(input_folder) 
-                           if os.path.isdir(os.path.join(input_folder, d)) 
-                           and d.isdigit()], key=int)
-    
-    if not timepoint_dirs:
-        print("No timepoint directories found.")
-        return
-    
-    # Get all unique FOVs from first timepoint
-    first_tp_path = os.path.join(input_folder, timepoint_dirs[0])
-    tiff_files = glob.glob(os.path.join(first_tp_path, "*.tif*"))
-    
-    # Group files by region_fov
-    fov_groups = {}
-    for file_path in tiff_files:
-        match = TIFF_PATTERN.match(os.path.basename(file_path))
-        if match:
-            region, fov, z, wavelength = match.groups()
-            key = f"{region}_{fov}"
-            if key not in fov_groups:
-                fov_groups[key] = []
-            fov_groups[key].append((region, int(fov), wavelength))
-    
-    # Process each FOV
-    for fov_key in tqdm(fov_groups.keys(), desc="Processing FOVs for z-max projection"):
-        region, fov, wavelength = fov_groups[fov_key][0]
-        print(f"\nProcessing {fov_key} for z-max projection...")
+    Parameters:
+    -----------
+    input_dir : str
+        Path to the directory containing TIFF files and time point folders
+    coordinate_csv : str, optional
+        Path to the CSV file containing region, fov, and coordinates information
+        If None, will look for coordinates.csv in the input directory
+    acquisition_params_json : str, optional
+        Path to the JSON file containing acquisition parameters
+        If None, will look for acquisition parameters.json in the input directory
+    configurations_xml : str, optional
+        Path to the XML file containing channel configurations
+        If None, will look for configurations.xml in the input directory
         
+    Returns:
+    --------
+    dict: Metadata and file mapping information
+    """
+    # Find and load files if not specified
+    coordinate_csv = os.path.join(input_dir,"0", "coordinates.csv")
+    acquisition_params_json = os.path.join(input_dir, "acquisition parameters.json")
+    configurations_xml = os.path.join(input_dir, "configurations.xml")
+    
+    # Load coordinates from CSV
+    if os.path.exists(coordinate_csv):
+        coordinates = pd.read_csv(coordinate_csv)
+        print(f"Loaded coordinates from {coordinate_csv}")
+    else:
+        coordinates = None
+        print("Warning: Coordinates CSV not found")
+    
+    # Load acquisition parameters
+    if os.path.exists(acquisition_params_json):
+        with open(acquisition_params_json, 'r') as f:
+            acq_params = json.load(f)
+        num_timepoints = acq_params.get('Nt', 1)
+        num_z = acq_params.get('Nz', 1)
+        print(f"Using Nt={num_timepoints}, Nz={num_z} from acquisition parameters")
+    else:
+        acq_params = {}
+        num_timepoints = None
+        num_z = None
+        print("Warning: Acquisition parameters JSON not found")
+    
+    # Load selected channels from configurations XML
+    selected_channels = []
+    channel_info = {}
+    
+    if os.path.exists(configurations_xml):
         try:
-            zmax = None  # To store the running maximum projection
+            tree = ET.parse(configurations_xml)
+            root = tree.getroot()
             
-            for tp_idx, tp_dir in enumerate(timepoint_dirs):
-                tp_path = os.path.join(input_folder, tp_dir)
+            for mode in root.findall('.//mode'):
+                name = mode.get('Name', '')
+                selected = mode.get('Selected', 'false').lower() == 'true'
                 
-                # Find files for this FOV at this timepoint
-                pattern = f"{region}_{fov}_*_Fluorescence_{wavelength}_nm_Ex.tif*"
-                matching_files = glob.glob(os.path.join(tp_path, pattern))
+                if 'Fluorescence' in name and 'nm Ex' in name and selected:
+                    # Extract wavelength from name (e.g., "Fluorescence 488 nm Ex")
+                    wavelength_match = re.search(r'(\d+)\s*nm', name)
+                    if wavelength_match:
+                        wavelength = wavelength_match.group(1)
+                        channel_name = f"Fluorescence_{wavelength}_nm_Ex"
+                        selected_channels.append(channel_name)
+                        
+                        channel_info[channel_name] = {
+                            'id': mode.get('ID'),
+                            'name': name,
+                            'wavelength': wavelength,
+                            'exposure': float(mode.get('ExposureTime', 0)),
+                            'intensity': float(mode.get('IlluminationIntensity', 0))
+                        }
+            
+            print(f"Selected channels from XML: {selected_channels}")
+        except Exception as e:
+            print(f"Warning: Error parsing configurations XML: {e}")
+    else:
+        print("Warning: Configurations XML not found")
+    
+    # Get all time point directories or use the input directory directly
+    if os.path.isdir(os.path.join(input_dir, '0')):  # Check if time point directories exist
+        timepoint_dirs = sorted([d for d in os.listdir(input_dir) 
+                                if os.path.isdir(os.path.join(input_dir, d)) and d.isdigit()],
+                                key=lambda x: int(x))
+        timepoint_dirs = [os.path.join(input_dir, d) for d in timepoint_dirs]
+    else:
+        # If no timepoint directories, assume the input directory is a single timepoint
+        timepoint_dirs = [input_dir]
+        if num_timepoints is None:
+            num_timepoints = 1
+    
+    # Get the actual number of timepoints based on available directories
+    if num_timepoints is None:
+        num_timepoints = len(timepoint_dirs)
+    else:
+        num_timepoints = min(num_timepoints, len(timepoint_dirs))
+    
+    # Process first timepoint to discover dimensions
+    first_tp_files = glob(os.path.join(timepoint_dirs[0], "*.tif*"))
+    
+    if not first_tp_files:
+        raise ValueError(f"No TIFF files found in {timepoint_dirs[0]}")
+    
+    # Extract pattern from filenames
+    # Example: C5_0_0_Fluorescence_488_nm_Ex.tiff
+    pattern = r'([^_]+)_(\d+)_(\d+)_(.+)\.tiff?'
+    
+    # Get unique regions, FOVs, and validate z levels from filenames
+    unique_regions = set()
+    unique_fovs = set()
+    z_levels = set()
+    found_channels = set()
+    
+    for file_path in first_tp_files:
+        filename = os.path.basename(file_path)
+        match = re.match(pattern, filename)
+        if match:
+            region, fov, z_level, channel_name = match.groups()
+            unique_regions.add(region)
+            unique_fovs.add(int(fov))
+            z_levels.add(int(z_level))
+            found_channels.add(channel_name)
+    
+    # Convert sets to sorted lists
+    unique_regions = sorted(list(unique_regions))
+    unique_fovs = sorted(list(unique_fovs))
+    z_levels = sorted(list(z_levels))
+    
+    # If Nz not provided in parameters, infer from z levels in files
+    if num_z is None:
+        num_z = max(z_levels) + 1
+        print(f"Inferring Nz={num_z} from file z levels")
+    
+    # Use selected channels from XML if available, otherwise use all found channels
+    if selected_channels:
+        # Filter to only include channels that actually exist in the files
+        channels_to_use = [ch for ch in selected_channels if any(ch in fc for fc in found_channels)]
+        if not channels_to_use:
+            print("Warning: None of the selected channels from XML match the files. Using all found channels.")
+            channels_to_use = sorted(list(found_channels))
+    else:
+        channels_to_use = sorted(list(found_channels))
+    
+    print(f"Using channels: {channels_to_use}")
+    
+    # Map channel names to indices
+    channel_map = {name: idx for idx, name in enumerate(channels_to_use)}
+    
+    # Create a file lookup dictionary to map coordinates to files
+    file_map = {}
+    
+    # Collect all TIFF files and organize them in the map
+    for t_idx, tp_dir in enumerate(timepoint_dirs[:num_timepoints]):
+        tiff_files = glob(os.path.join(tp_dir, "*.tif*"))
+        for tiff_file in tiff_files:
+            filename = os.path.basename(tiff_file)
+            match = re.match(pattern, filename)
+            if match:
+                region, fov, z_level, full_channel_name = match.groups()
+                z_level = int(z_level)
+                fov = int(fov)
                 
-                if not matching_files:
+                # Find the channel from the ones we're using
+                channel_name = None
+                for ch in channels_to_use:
+                    if ch in full_channel_name:
+                        channel_name = ch
+                        break
+                
+                # Skip if channel not in our list or z level out of range
+                if channel_name is None or z_level >= num_z:
                     continue
                 
-                # If multiple z-slices, use middle one (like original script uses ResolutionLevel 0)
-                if len(matching_files) > 1:
-                    z_files = []
-                    for f in matching_files:
-                        match = TIFF_PATTERN.match(os.path.basename(f))
-                        if match:
-                            z_files.append((int(match.group(3)), f))
-                    z_files.sort()
-                    file_to_use = z_files[len(z_files)//2][1]
-                else:
-                    file_to_use = matching_files[0]
+                # Find indices in the array
+                region_idx = unique_regions.index(region) if region in unique_regions else None
+                fov_idx = unique_fovs.index(fov) if fov in unique_fovs else None
+                channel_idx = channel_map.get(channel_name)
                 
-                # Read data (equivalent to reading from HDF5 TimePoint/Channel 0/Data)
-                data = tifffile.imread(file_to_use)
-                print(f"TimePoint {tp_idx}: Data shape {data.shape}, dtype {data.dtype}")
+                # Skip if any index not found
+                if region_idx is None or fov_idx is None or channel_idx is None:
+                    continue
                 
-                if zmax is None:
-                    zmax = data.astype(np.uint16)
-                else:
-                    zmax = np.maximum(zmax, data)
-            
-            if zmax is not None:
-                print(f"Final z-max projection shape: {zmax.shape}, dtype: {zmax.dtype}")
-                
-                # Save the z-max projection TIFF
-                output_filename = f"{fov_key}_zmax.tif"
-                output_path = os.path.join(zmax_folder, output_filename)
-                tifffile.imwrite(output_path, zmax)
-                print(f"Saved z-max projection for {fov_key} to {output_path}")
-        
+                # Store file path in map
+                key = (t_idx, region_idx, fov_idx, z_level, channel_idx)
+                file_map[key] = tiff_file
+    
+    # Need to determine image dimensions to complete metadata
+    if file_map:
+        # Sample a file to get image dimensions
+        sample_file = next(iter(file_map.values()))
+        try:
+            import tifffile
+            sample_img = tifffile.imread(sample_file)
+            y_size, x_size = sample_img.shape
         except Exception as e:
-            print(f"Error processing {fov_key}: {e}")
+            print(f"Warning: Could not read sample file to determine dimensions: {e}")
+            y_size, x_size = None, None
+    else:
+        y_size, x_size = None, None
+    
+    # Create coordinate arrays for metadata
+    time_array = list(range(num_timepoints))
+    region_array = unique_regions
+    fov_array = unique_fovs
+    z_array = list(range(num_z))
+    channel_array = channels_to_use
+    
+    # Create dictionary with all the dimension information
+    dimensions = {
+        'time': num_timepoints,
+        'region': len(unique_regions),
+        'fov': len(unique_fovs),
+        'z': num_z,
+        'channel': len(channels_to_use),
+        'y': y_size,
+        'x': x_size
+    }
+    
+    # Create coordinates information
+    coords_info = {}
+    if coordinates is not None:
+        for col in coordinates.columns:
+            coords_info[col] = coordinates[col].tolist()
+    
+    # Build the final metadata package
+    metadata = {
+        'file_map': file_map,
+        'dimensions': dimensions,
+        'regions': unique_regions,
+        'fovs': unique_fovs,
+        'channels': channels_to_use,
+        'channel_info': channel_info,
+        'acquisition_parameters': acq_params,
+        'coordinates': coords_info,
+        'dimension_arrays': {
+            'time': time_array,
+            'region': region_array,
+            'fov': fov_array,
+            'z': z_array,
+            'channel': channel_array
+        }
+    }
+    
+    print(f"Created mapping with dimensions: {dimensions}")
+    print(f"Mapped {len(file_map)} files")
+    
+    return metadata
 
-##############################
-# 2. Cellpose Segmentation Function (Unchanged)
-##############################
-def run_cellpose_segmentation_cyto2(input_folder, channels=(0, 0), diameter=None,
-                                    flow_threshold=0.4, cellprob_threshold=0.0, gpu=True):
+def get_zarr_store_with_lazy_tiff_mapping(input_dir):
     """
-    Run cellpose segmentation (cyto2) on TIFF images located in input_folder.
-    Saves both mask images and high-resolution overlay images in a subfolder called 'mask_cyto2'.
+    Get metadata and file mapping for TIFF files.
+    
+    Parameters:
+    -----------
+    Same as create_tiff_zarr_map
+    
+    Returns:
+    --------
+    dict: Comprehensive metadata and file mapping information
     """
-    # Create folder to store cellpose outputs
-    mask_folder = os.path.join(input_folder, "mask_cyto2")
-    os.makedirs(mask_folder, exist_ok=True)
+    # Create the mapping
+    metadata = create_tiff_zarr_map(input_dir)
+    
+    # For compatibility with previous versions, return a tuple
+    return metadata
 
-    # Load the Cellpose model (cyto2) - Updated for new API with fallbacks
-    model = None
-    gpu_working = gpu
+class Worker(QThread):
+    finished = pyqtSignal(str, str)
+    error = pyqtSignal(str, str)
+    
+    def __init__(self, directory):
+        super().__init__()
+        self.directory = directory
+        
+    def run(self):
+        try:
+            folder_name = os.path.basename(os.path.normpath(self.directory))
+            
+            # Get metadata for the selected directory
+            metadata = get_zarr_store_with_lazy_tiff_mapping(self.directory)
+            
+            # Save the metadata to a temporary file
+            temp_dir = tempfile.gettempdir()
+            temp_file = os.path.join(temp_dir, f"ndv_metadata_{os.getpid()}_{hash(folder_name)}.pkl")
+            
+            with open(temp_file, 'wb') as f:
+                pickle.dump({
+                    'directory': self.directory,
+                    'metadata': metadata,
+                    'folder_name': folder_name
+                }, f)
+            
+            # Emit signal with the temp file path
+            self.finished.emit(temp_file, folder_name)
+            
+        except Exception as e:
+            import traceback
+            print(f"Error processing acquisition: {str(e)}")
+            print(traceback.format_exc())
+            self.error.emit(str(e), folder_name)
+
+class DirectorySelector(QDialog):
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+        
+    def initUI(self):
+        self.setWindowTitle('Select Acquisition Directory')
+        self.setGeometry(300, 300, 400, 150)
+        
+        layout = QVBoxLayout()
+        
+        self.label = QLabel('Drag and drop your acquisition directory here')
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label.setStyleSheet("""
+            QLabel {
+                border: 2px dashed #aaa;
+                border-radius: 5px;
+                padding: 20px;
+                background-color: #f0f0f0;
+            }
+        """)
+        layout.addWidget(self.label)
+        
+        self.setLayout(layout)
+        
+        # Enable drag and drop
+        self.setAcceptDrops(True)
+    
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+    
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls:
+            directory = urls[0].toLocalFile()
+            if os.path.isdir(directory):
+                folder_name = os.path.basename(os.path.normpath(directory))
+                self.label.setText(f'Loading: {folder_name}')
+                
+                # Create worker thread
+                self.worker = Worker(directory)
+                self.worker.finished.connect(self.launch_ndv)
+                self.worker.error.connect(self.handle_error)
+                self.worker.start()
+    
+    def launch_ndv(self, temp_file, folder_name):
+        self.label.setText(f'Opened: {folder_name}')
+        
+        # Create a separate Python script to launch napari
+        launcher_script = os.path.join(tempfile.gettempdir(), f"napari_launcher_{os.getpid()}_{hash(folder_name)}.py")
+        
+        with open(launcher_script, 'w') as f:
+            f.write(f"""
+import os
+import sys
+import pickle
+import napari
+import dask.array as da
+import dask
+import tifffile
+import numpy as np
+from napari.layers import Image
+from pathlib import Path
+
+# Add the directory containing downsampler to Python path
+sys.path.insert(0, r'{os.path.dirname(os.path.abspath(__file__))}')
+
+# Try to import downsampler
+try:
+    from downsampler import DownsampledNavigator
+    NAVIGATOR_AVAILABLE = True
+    print("Successfully imported downsampler module in launcher")
+except ImportError as e:
+    print(f"Warning: Navigator module not available in launcher: {{e}}")
+    NAVIGATOR_AVAILABLE = False
+
+# Load the metadata from the temp file
+with open(sys.argv[1], 'rb') as f:
+    data = pickle.load(f)
+
+directory = data['directory']
+metadata = data['metadata']
+folder_name = data['folder_name']
+
+print(f"Launching napari for: {{folder_name}}")
+print(f"Directory: {{directory}}")
+print(f"Navigator available: {{NAVIGATOR_AVAILABLE}}")
+
+# Get dimensions
+dims = metadata['dimensions']
+file_map = metadata['file_map']
+acq_params = metadata['acquisition_parameters']
+
+print(f"Dimensions: {{dims}}")
+
+# Calculate pixel size in microns
+pixel_size_um = None
+z_step_um = None
+
+if acq_params:
+    # Get pixel size from sensor pixel size and objective magnification
+    if 'sensor_pixel_size_um' in acq_params and 'objective' in acq_params and 'magnification' in acq_params['objective']:
+        sensor_pixel_size = acq_params['sensor_pixel_size_um']
+        magnification = acq_params['objective']['magnification']
+        pixel_size_um = sensor_pixel_size / magnification
+        print(f"Calculated pixel size: {{pixel_size_um:.3f}} µm")
+    
+    # Get Z step size
+    if 'dz(um)' in acq_params:
+        z_step_um = acq_params['dz(um)']
+        print(f"Z step size: {{z_step_um}} µm")
+
+# Default values if not found in parameters
+if pixel_size_um is None:
+    pixel_size_um = 1.0
+    print("Warning: Using default pixel size of 1.0 µm")
+    
+if z_step_um is None:
+    z_step_um = 1.0
+    print("Warning: Using default Z step size of 1.0 µm")
+
+# Create a function that loads TIFF files on demand
+@dask.delayed
+def load_tiff(t, r, f, z, c):
+    key = (t, r, f, z, c)
+    if key in file_map:
+        return tifffile.imread(file_map[key])
+    else:
+        return np.zeros((dims['y'], dims['x']), dtype=np.uint16)
+
+# Create a dask array with a delayed loader function
+lazy_arrays = []
+for t in range(dims['time']):
+    channel_arrays = []
+    for c in range(dims['channel']):
+        region_arrays = []
+        for r in range(dims['region']):
+            fov_arrays = []
+            for f in range(dims['fov']):
+                z_arrays = []
+                for z in range(dims['z']):
+                    # Create a delayed reader for each position
+                    delayed_reader = load_tiff(t, r, f, z, c)
+                    # Convert to a dask array
+                    sample_shape = (dims['y'], dims['x'])
+                    lazy_array = da.from_delayed(delayed_reader, shape=sample_shape, dtype=np.uint16)
+                    z_arrays.append(lazy_array)
+                fov_arrays.append(da.stack(z_arrays))
+            region_arrays.append(da.stack(fov_arrays))
+        channel_arrays.append(da.stack(region_arrays))
+    lazy_arrays.append(da.stack(channel_arrays))
+
+# Stack everything into a single dask array
+dask_data = da.stack(lazy_arrays)
+
+# Display the data using napari
+print(f"Opening napari viewer for: {{folder_name}}")
+viewer = napari.Viewer(title=f"Napari - {{folder_name}}")
+
+# The dimensions are: (t, c, r, f, z, y, x)
+channel_names = metadata['channels']
+region_names = metadata['regions']
+fov_names = metadata['fovs']
+
+print(f"Channel names: {{channel_names}}")
+print(f"Region names: {{region_names}}")
+print(f"FOV names: {{fov_names}}")
+
+# Calculate scale for each dimension
+# [time, region, fov, z, y, x]
+# For time, region, and fov, we use 1.0 as they're indices
+# For z, y, x we use the physical dimensions
+scale = [1.0, 1.0, 1.0, z_step_um, pixel_size_um, pixel_size_um]
+
+# Add each channel as a separate layer
+for c in range(dims['channel']):
+    # For each channel, we keep all other dimensions
+    # This creates a 6D array: (t, r, f, z, y, x)
+    channel_data = dask_data[:, c, :, :, :, :, :]
+    
+    # Create a meaningful name for the layer
+    layer_name = f"Channel: {{channel_names[c]}}"
+    
+    # Add to viewer with appropriate dimension labels and scale
+    viewer.add_image(
+        channel_data,
+        name=layer_name,
+        scale=scale,  # Apply physical scale
+        blending='additive',
+        colormap='gray',
+        # Define dimension names for sliders
+        # The order should match the dimensions in the array
+        multiscale=False,
+        metadata={{
+            'dimension_names': ['Time', 'Region', 'FOV', 'Z', 'Y', 'X']
+        }}
+    )
+
+# Set dimension labels for the sliders
+viewer.dims.axis_labels = ['Time', 'Region', 'FOV', 'Z', 'Y', 'X']
+
+# Add physical units to the dimension labels
+if z_step_um is not None and pixel_size_um is not None:
+    viewer.scale_bar.unit = 'µm'
+    viewer.scale_bar.visible = True
+
+# ===== ADD NAVIGATOR FUNCTIONALITY =====
+if NAVIGATOR_AVAILABLE and dims['region'] > 0 and dims['fov'] > 0:
+    print("Creating navigator overlay...")
     
     try:
-        # Try GPU first if requested
-        if gpu:
-            print("GPU detected:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None")
-            model = models.CellposeModel(model_type='cyto2', gpu=True)
-            print("Loaded CellposeModel with GPU=True")
+        # Create navigator with progress callback
+        def progress_callback(percent, message):
+            print(f"Navigator: {{percent}}% - {{message}}")
+        
+        navigator = DownsampledNavigator(
+            Path(directory), 
+            tile_size=75,  # Good balance of quality and speed
+            cache_enabled=True,
+            progress_callback=progress_callback
+        )
+        
+        # Create mosaic for current timepoint
+        current_time = viewer.dims.current_step[0] if viewer.dims.current_step else 0
+        print(f"Creating navigator mosaic for timepoint {{current_time}}")
+        
+        mosaic_array, nav_metadata = navigator.create_mosaic(current_time)
+        
+        print(f"Navigator mosaic created: shape={{mosaic_array.shape}}, range={{mosaic_array.min()}}-{{mosaic_array.max()}}")
+        print(f"Non-zero pixels: {{np.count_nonzero(mosaic_array)}}")
+        
+        # Ensure the mosaic has data
+        if np.count_nonzero(mosaic_array) == 0:
+            print("WARNING: Navigator mosaic is empty! Skipping navigator.")
         else:
-            model = models.CellposeModel(model_type='cyto2', gpu=False)
-            print("Loaded CellposeModel with GPU=False")
-    except Exception as e:
-        print(f"Failed to load model with GPU={gpu}: {e}")
-        try:
-            # Fallback to CPU
-            print("Falling back to CPU...")
-            model = models.CellposeModel(model_type='cyto2', gpu=False)
-            gpu_working = False
-            print("Loaded CellposeModel with GPU=False (fallback)")
-        except Exception as e2:
-            print(f"Failed to load model with CPU fallback: {e2}")
-            return
-
-    # List all TIFF files in the folder
-    image_files = [f for f in os.listdir(input_folder) if f.lower().endswith('.tif')]
-    if not image_files:
-        print("No TIFF files found in", input_folder)
-        return
-
-    for image_file in tqdm(image_files, desc="Segmenting TIFF images"):
-        try:
-            image_path = os.path.join(input_folder, image_file)
-            img = tifffile.imread(image_path)
+            print("Navigator mosaic has data, proceeding with display...")
             
-            # Ensure image is in correct format (2D grayscale)
-            if len(img.shape) > 2:
-                if img.shape[2] > 1:
-                    # Convert to grayscale if multichannel
-                    img = img[:, :, 0]
-                else:
-                    img = img.squeeze()
+            # Add navigator as an overlay layer
+            nav_layer = viewer.add_image(
+                mosaic_array,
+                name='Navigator',
+                opacity=1.0,  # Fully opaque
+                colormap='gray',
+                visible=True,
+                scale=(1, 1),  # Navigator has its own coordinate system
+                translate=(0, 0),  # Start at origin, we'll position it after
+                metadata=nav_metadata,
+                contrast_limits=(0, 255),  # Full contrast range
+                gamma=0.8  # Lower gamma for brighter appearance
+            )
             
-            print(f"Processing {image_file}, shape: {img.shape}, dtype: {img.dtype}")
-
-            # Run Cellpose segmentation - Handle version differences
-            try:
-                # Try new Cellpose API (v4.x): returns 3 values
-                result = model.eval(
-                    img,
-                    diameter=diameter,
-                    channels=[channels[0], channels[1]],
-                    flow_threshold=flow_threshold,
-                    cellprob_threshold=cellprob_threshold
-                )
+            print(f"Navigator layer added: {{nav_layer.name}}")
+            
+            # Position navigator at outer top-right edge of actual FOV image
+            # Use napari's extent property to get actual world coordinate bounds
+            
+            print("=== NAVIGATOR POSITIONING ===")
+            
+            # Find the main FOV image layer to get its actual bounds
+            main_image_layer = None
+            for layer in viewer.layers:
+                if hasattr(layer, 'data') and 'Channel:' in layer.name:
+                    main_image_layer = layer
+                    break
+            
+            if main_image_layer:
+                # Get the actual world coordinate bounds using napari's extent property
+                extent = main_image_layer.extent
+                print(f"Main layer extent: {{extent}}")
                 
-                if len(result) == 3:
-                    masks, flows, styles = result
-                    diams = None
-                elif len(result) == 4:
-                    masks, flows, styles, diams = result
-                else:
-                    print(f"Unexpected number of return values: {len(result)}")
-                    continue
-                    
-            except Exception as eval_error:
-                print(f"Error during model evaluation for {image_file}: {eval_error}")
+                # extent.world gives us the actual world coordinate bounds: 
+                # [[min_coords], [max_coords]] for all dimensions
+                world_bounds = extent.world
+                print(f"World bounds: {{world_bounds}}")
                 
-                # If GPU fails, try CPU fallback for this image
-                if gpu_working:
-                    print("Trying CPU fallback for this image...")
-                    try:
-                        cpu_model = models.CellposeModel(model_type='cyto2', gpu=False)
-                        result = cpu_model.eval(
-                            img,
-                            diameter=diameter,
-                            channels=[channels[0], channels[1]],
-                            flow_threshold=flow_threshold,
-                            cellprob_threshold=cellprob_threshold
-                        )
-                        
-                        if len(result) == 3:
-                            masks, flows, styles = result
-                            diams = None
-                        elif len(result) == 4:
-                            masks, flows, styles, diams = result
-                        else:
-                            print(f"CPU fallback also failed for {image_file}")
-                            continue
-                            
-                    except Exception as cpu_error:
-                        print(f"CPU fallback also failed for {image_file}: {cpu_error}")
-                        continue
-                else:
-                    continue
-
-            # Adjust mask size if necessary
-            if masks.shape != img.shape:
-                print(f"Resizing mask from {masks.shape} to match input image dimensions {img.shape}")
-                masks = resize(masks, img.shape, order=0, preserve_range=True,
-                               anti_aliasing=False).astype(np.uint16)
+                # For positioning, we need the last two dimensions (Y, X)
+                # world_bounds shape is (2, ndim) where [0] is min coords, [1] is max coords
+                fov_right = world_bounds[1, -1]  # Max X coordinate (right edge)
+                fov_top = world_bounds[0, -2]    # Min Y coordinate (top edge)
+                
+                print(f"FOV right edge (X): {{fov_right}}")
+                print(f"FOV top edge (Y): {{fov_top}}")
+                
             else:
-                print("Mask dimensions match input image dimensions.")
-
-            # Save mask and overlay image
-            base_name = os.path.splitext(image_file)[0]
-            mask_filename = f"{base_name}_mask_cyto2.tif"
-            mask_path = os.path.join(mask_folder, mask_filename)
-            tifffile.imwrite(mask_path, masks.astype(np.uint16))
-
-            # QC: Save the overlay visualization
-            try:
-                fig = plt.figure(figsize=(12, 5))
-                plot.show_segmentation(fig, img, masks, flows[0], channels=[channels[0], channels[1]])
-                plt.tight_layout()
-                overlay_filename = f"{base_name}_overlay_cyto2.png"
-                overlay_path = os.path.join(mask_folder, overlay_filename)
-                plt.savefig(overlay_path, dpi=300)
-                plt.close(fig)
-                
-                print(f"Processed {image_file}")
-                print(f"  Mask: {mask_path}")
-                print(f"  Overlay: {overlay_path}")
-                
-                # QC: Print number of cells detected
-                n_cells = len(np.unique(masks)) - 1  # Subtract background
-                print(f"  Cells detected: {n_cells}")
-                
-            except Exception as plot_error:
-                print(f"Failed to create overlay plot for {image_file}: {plot_error}")
-                print(f"  Mask saved: {mask_path}")
-                n_cells = len(np.unique(masks)) - 1
-                print(f"  Cells detected: {n_cells}")
-                
-        except Exception as e:
-            print(f"Failed to process {image_file}: {e}")
-            continue
-
-##############################
-# 3. Intensity Extraction Functions (Adapted for TIFF)
-##############################
-def extract_mean_intensities(acquisition_folder, mask_file, fov_key, channel="488"):
-    """
-    For each time point in the acquisition folder,
-    compute the mean pixel intensity for each cell region defined in the mask.
-    """
-    # Parse region and fov from fov_key
-    parts = fov_key.split('_')
-    region = parts[0]
-    fov = parts[1]
-    
-    # Get timepoint directories
-    timepoint_dirs = sorted([d for d in os.listdir(acquisition_folder) 
-                           if os.path.isdir(os.path.join(acquisition_folder, d)) 
-                           and d.isdigit()], key=int)
-    
-    print("Found time points:", [f"TimePoint {i}" for i in range(len(timepoint_dirs))])
-    
-    mask = tifffile.imread(mask_file)
-    unique_labels = np.unique(mask)
-    unique_labels = unique_labels[unique_labels != 0]  # ignore background
-    print("Unique mask labels:", unique_labels)
-    
-    results = {int(label): [] for label in unique_labels}
-    time_points = []
-    
-    for tp_idx, tp_dir in enumerate(tqdm(timepoint_dirs, desc="Extracting intensities per time point")):
-        tp_path = os.path.join(acquisition_folder, tp_dir)
-        
-        # Find the TIFF file for this timepoint (like accessing HDF5 path)
-        pattern = f"{region}_{fov}_*_Fluorescence_{channel}_nm_Ex.tif*"
-        matching_files = glob.glob(os.path.join(tp_path, pattern))
-        
-        if not matching_files:
-            print(f"No file found for TimePoint {tp_idx}")
-            continue
-        
-        # Use middle z if multiple
-        if len(matching_files) > 1:
-            z_files = []
-            for f in matching_files:
-                match = TIFF_PATTERN.match(os.path.basename(f))
-                if match:
-                    z_files.append((int(match.group(3)), f))
-            z_files.sort()
-            file_to_use = z_files[len(z_files)//2][1]
-        else:
-            file_to_use = matching_files[0]
-        
-        # Read image data
-        image_data = tifffile.imread(file_to_use)
-        
-        if image_data.shape != mask.shape:
-            print(f"Shape mismatch at TimePoint {tp_idx}: image {image_data.shape} vs mask {mask.shape}")
-            continue
-        
-        for label in results.keys():
-            region = image_data[mask == label]
-            mean_val = np.mean(region) if region.size > 0 else np.nan
-            results[label].append(mean_val)
+                print("No main image layer found, using fallback")
+                # Fallback to metadata approach
+                fov_right = dims.get('x', 5000)
+                fov_top = 0
             
-        time_val = int(tp_idx)
-        time_points.append(time_val)
+            # Position navigator just outside the right edge
+            nav_height, nav_width = mosaic_array.shape
+            gap = 1
             
-    return np.array(time_points), results
+            nav_x_position = fov_right + gap  # RIGHT EDGE + gap
+            nav_y_position = fov_top + gap    # TOP EDGE + gap
+            
+            print(f"Navigator position: x={{nav_x_position}}, y={{nav_y_position}}")
+            print("=== END POSITIONING ===")
+            
+            nav_layer.translate = (nav_y_position, nav_x_position)
+            
+            # Add a simple bounding box around the navigator
+            nav_border_coords = [
+                [nav_y_position, nav_x_position],  # Top-left
+                [nav_y_position, nav_x_position + nav_width],  # Top-right
+                [nav_y_position + nav_height, nav_x_position + nav_width],  # Bottom-right
+                [nav_y_position + nav_height, nav_x_position]  # Bottom-left
+            ]
+            
+            nav_border_layer = viewer.add_shapes(
+                [nav_border_coords],
+                shape_type='rectangle',
+                edge_color='white',
+                face_color='transparent',
+                edge_width=2,
+                name='Navigator Border',
+                opacity=1.0
+            )
+            
+            # Make the border non-interactive
+            nav_border_layer.interactive = False
+            nav_border_layer.editable = False
+            nav_border_layer.mouse_pan = False
+            nav_border_layer.mouse_zoom = False
+            
+            # Make navigator interactive for clicking
+            nav_layer.interactive = True
+            
+            # Function to handle clicks on navigator - simplified coordinate handling
+            @nav_layer.mouse_drag_callbacks.append
+            def on_navigator_click(layer, event):
+                if event.button == 1:  # Left click
+                    # Get click position - this is in the viewer's coordinate system
+                    pos = event.position
+                    if len(pos) >= 2:
+                        viewer_click_y, viewer_click_x = pos[-2], pos[-1]
+                        
+                        # Convert to navigator-local coordinates by subtracting navigator position
+                        nav_y_pos, nav_x_pos = nav_layer.translate
+                        nav_local_x = viewer_click_x - nav_x_pos
+                        nav_local_y = viewer_click_y - nav_y_pos
+                        
+                        # Check if click is within navigator bounds
+                        if (0 <= nav_local_x < nav_width and 0 <= nav_local_y < nav_height):
+                            # Convert to grid coordinates
+                            tile_size = nav_metadata['tile_size']
+                            grid_col = int(nav_local_x / tile_size)
+                            grid_row = int(nav_local_y / tile_size)
+                            
+                            print(f"Navigator click: viewer({{viewer_click_x}}, {{viewer_click_y}}) -> nav_local({{nav_local_x}}, {{nav_local_y}}) -> grid({{grid_row}}, {{grid_col}})")
+                            
+                            # Find the corresponding FOV
+                            fov_grid = nav_metadata.get('fov_grid', {{}})
+                            if (grid_row, grid_col) in fov_grid:
+                                clicked_fov = fov_grid[(grid_row, grid_col)]
+                                clicked_region = nav_metadata.get('regions', {{}}).get(clicked_fov, 'unknown')
+                                
+                                print(f"Clicked FOV: {{clicked_fov}}, Region: {{clicked_region}}")
+                                
+                                # Find indices in the main viewer
+                                try:
+                                    region_idx = region_names.index(clicked_region) if clicked_region in region_names else None
+                                    fov_idx = fov_names.index(clicked_fov) if clicked_fov in fov_names else None
+                                    
+                                    if region_idx is not None and fov_idx is not None:
+                                        # Update viewer dimensions to jump to this FOV
+                                        current = list(viewer.dims.current_step)
+                                        if len(current) >= 3:
+                                            current[1] = region_idx  # Region dimension
+                                            current[2] = fov_idx     # FOV dimension
+                                            viewer.dims.current_step = current
+                                            print(f"Jumped to Region: {{clicked_region}} (idx={{region_idx}}), FOV: {{clicked_fov}} (idx={{fov_idx}})")
+                                    else:
+                                        print(f"Could not find indices for region/FOV: {{clicked_region}}/{{clicked_fov}}")
+                                        
+                                except Exception as e:
+                                    print(f"Error in navigator click handling: {{e}}")
+                            else:
+                                print(f"No FOV found at grid position ({{grid_row}}, {{grid_col}})")
+                        else:
+                            print(f"Click outside navigator bounds: nav_local({{nav_local_x}}, {{nav_local_y}})")
+            
+            # Create navigator box overlay
+            nav_box_layer = None
+            
+            # Function to update navigator box - simplified positioning
+            def update_navigator_box():
+                global nav_box_layer
+                try:
+                    # Get current FOV and region from sliders
+                    current_step = viewer.dims.current_step
+                    if len(current_step) >= 3:
+                        region_idx = current_step[1]
+                        fov_idx = current_step[2]
+                        
+                        # Get the actual region and fov names
+                        if region_idx < len(region_names) and fov_idx < len(fov_names):
+                            region_name = region_names[region_idx]
+                            fov_name = fov_names[fov_idx]
+                            
+                            # Find this FOV in the navigator grid
+                            fov_to_grid = nav_metadata.get('fov_to_grid_pos', {{}})
+                            
+                            if fov_name in fov_to_grid:
+                                grid_row, grid_col = fov_to_grid[fov_name]
+                                tile_size = nav_metadata['tile_size']
+                                
+                                # Calculate position in viewer coordinates
+                                # Start with grid position in navigator-local coordinates
+                                nav_local_x = grid_col * tile_size + tile_size // 2
+                                nav_local_y = grid_row * tile_size + tile_size // 2
+                                
+                                # Convert to viewer coordinates by adding navigator position
+                                nav_y_pos, nav_x_pos = nav_layer.translate
+                                viewer_x = nav_local_x + nav_x_pos
+                                viewer_y = nav_local_y + nav_y_pos
+                                
+                                # Create a rectangle shape for the box
+                                box_size = tile_size * 0.8
+                                box_coords = [
+                                    [viewer_y - box_size//2, viewer_x - box_size//2],
+                                    [viewer_y - box_size//2, viewer_x + box_size//2],
+                                    [viewer_y + box_size//2, viewer_x + box_size//2],
+                                    [viewer_y + box_size//2, viewer_x - box_size//2]
+                                ]
+                                
+                                # Remove existing box layer if it exists
+                                if nav_box_layer is not None and nav_box_layer in viewer.layers:
+                                    viewer.layers.remove(nav_box_layer)
+                                
+                                # Add new box as a shapes layer
+                                nav_box_layer = viewer.add_shapes(
+                                    [box_coords],
+                                    shape_type='rectangle',
+                                    edge_color='red',
+                                    face_color='transparent',
+                                    edge_width=3,
+                                    name='Navigator Box',
+                                    opacity=1.0
+                                )
+                                
+                                # Make the red box non-interactive and prevent selection
+                                nav_box_layer.interactive = False
+                                nav_box_layer.visible = True
+                                nav_box_layer.editable = False
+                                nav_box_layer.mouse_pan = False
+                                nav_box_layer.mouse_zoom = False
+                                
+                                # Force selection back to navigator layer immediately
+                                viewer.layers.selection.active = nav_layer
+                                
+                                print(f"Updated navigator box for FOV {{fov_name}} at grid({{grid_row}}, {{grid_col}}) -> viewer({{viewer_x}}, {{viewer_y}})")
+                            else:
+                                print(f"FOV {{fov_name}} not found in navigator grid mapping")
+                                
+                except Exception as e:
+                    print(f"Error updating navigator box: {{e}}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Connect the update function to dimension changes
+            viewer.dims.events.current_step.connect(update_navigator_box)
+            
+            # Add layer selection event handler to prevent navigator box selection
+            @viewer.layers.selection.events.active.connect
+            def on_layer_selection_changed(event):
+                # If navigator box is selected, immediately switch back to navigator
+                if (hasattr(event, 'value') and event.value is not None and 
+                    hasattr(event.value, 'name') and event.value.name == 'Navigator Box'):
+                    try:
+                        viewer.layers.selection.active = nav_layer
+                        print("Prevented Navigator Box selection, switched back to Navigator")
+                    except Exception as e:
+                        print(f"Error switching back to navigator layer: {{e}}")
+            
+            # Add event listener to handle new layer insertions
+            @viewer.layers.events.inserted.connect
+            def on_layer_inserted(event):
+                # Always keep navigator as the active layer for interaction
+                try:
+                    if nav_layer in viewer.layers:
+                        viewer.layers.selection.active = nav_layer
+                except Exception as e:
+                    print(f"Error maintaining navigator selection: {{e}}")
+            
+            # Initial update
+            update_navigator_box()
+            
+            print("Navigator overlay created successfully!")
+            
+    except Exception as e:
+        print(f"Failed to create navigator: {{e}}")
+        import traceback
+        traceback.print_exc()
 
-def compute_f_f0(time_points, results, baseline_times=[5, 6, 7, 8]):
-    """
-    Compute Fâ‚€ for each cell as the mean intensity over the baseline time points,
-    then compute F/Fâ‚€ for every time point.
-    """
-    f_f0 = {}
-    time_points = np.array(time_points)
-    baseline_mask = np.isin(time_points, baseline_times)
-    if not np.any(baseline_mask):
-        raise ValueError("None of the specified baseline time points were found in the data.")
-    
-    for cell_id, intensities in results.items():
-        intensities = np.array(intensities, dtype=float)
-        baseline = np.mean(intensities[baseline_mask])
-        if baseline == 0:
-            f_f0[cell_id] = intensities / 1e-6
-        else:
-            f_f0[cell_id] = intensities / baseline
-    return f_f0
-
-def process_pair(acquisition_folder, mask_file, output_dir, fov_key, channel="488", baseline_times=[5,6,7,8]):
-    """
-    Process one pair of acquisition folder and mask file:
-      - Extract mean intensity data.
-      - Compute F/Fâ‚€ values.
-      - Save a CSV with columns: Time_min, Cell_ID, Raw_Intensity, F0, F/Fâ‚€.
-    """
-    print("Processing:", fov_key)
-    time_points, results = extract_mean_intensities(acquisition_folder, mask_file, fov_key, channel)
-    base_name = fov_key
-    
-    # Compute F/Fâ‚€ and Fâ‚€ per cell.
-    f_f0 = compute_f_f0(time_points, results, baseline_times)
-    f0_dict = {}
-    for cell_id, intensities in results.items():
-        intensities = np.array(intensities, dtype=float)
-        baseline_val = np.mean(intensities[np.isin(time_points, baseline_times)])
-        f0_dict[cell_id] = baseline_val
-        
-    # Build CSV rows.
-    rows = []
-    for cell_id in sorted(results.keys()):
-        for i, t in enumerate(time_points):
-            rows.append({
-                "Time_min": t + 1,  # converting 0-index to minute count
-                "Cell_ID": cell_id,
-                "Raw_Intensity": results[cell_id][i],
-                "F0": f0_dict[cell_id],
-                "F/F0": f_f0[cell_id][i]
-            })
-    df = pd.DataFrame(rows)
-    csv_save = os.path.join(output_dir, base_name + "_data.csv")
-    df.to_csv(csv_save, index=False)
-    print("Saved CSV data to", csv_save)
-
-##############################
-# 4. Plotting Functions for Analysis (Unchanged)
-##############################
-def plot_heatmap_from_csv(csv_file, output_folder, contrast_min=None, contrast_max=None,
-                          cmap='inferno', figsize=None, font_family="Arial", font_size=12, dpi=300):
-    """
-    Creates a heatmap of F/Fâ‚€ values from a CSV file.
-    Only time points â‰¥ 5 are used. Adjusts the time axis and sorts rows.
-    """
-    plt.rcParams.update({"font.family": font_family, "font.size": font_size})
-    df = pd.read_csv(csv_file)
-    
-    heatmap_df = df.pivot(index='Cell_ID', columns='Time_min', values='F/F0')
-    heatmap_df = heatmap_df.loc[:, heatmap_df.columns >= 5].copy()
-    heatmap_df.columns = heatmap_df.columns - 4  # adjust time axis
-    
-    sort_col = 16  # adjusted time corresponding to original time point 10
-    if sort_col in heatmap_df.columns:
-        heatmap_df = heatmap_df.sort_values(by=sort_col, ascending=False)
+else:
+    if not NAVIGATOR_AVAILABLE:
+        print("Navigator not available - module not imported")
     else:
-        print(f"Time_min {sort_col} not found. Sorting by last available time point.")
-        heatmap_df = heatmap_df.sort_values(by=heatmap_df.columns.max(), ascending=False)
-    
-    n_cells, n_time = heatmap_df.shape
-    if figsize is None:
-        width = max(10, n_time * 0.5)
-        height = max(6, n_cells * 0.15)
-        figsize = (width, height)
-    
-    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    heatmap_data = heatmap_df.values
-    im = ax.imshow(heatmap_data, aspect='auto', cmap=cmap, interpolation='nearest',
-                   vmin=contrast_min, vmax=contrast_max)
-    ax.set_xlabel("Time (min)")
-    ax.set_ylabel("Cell ID")
-    ax.set_title("Heatmap of $F/F_0$")
-    ax.set_xticks(np.arange(n_time))
-    ax.set_xticklabels(heatmap_df.columns, rotation=0)
-    ax.set_yticks([])
-    fig.colorbar(im, ax=ax, label=r"$F/F_0$")
-    
-    base_filename = os.path.splitext(os.path.basename(csv_file))[0]
-    out_path = os.path.join(output_folder, f"{base_filename}_heatmap_FF0.png")
-    fig.savefig(out_path, dpi=dpi)
-    plt.show()
-    print("Saved heatmap to", os.path.abspath(out_path))
-    return heatmap_df
+        print(f"Navigator conditions not met: regions={{dims.get('region', 0)}}, fovs={{dims.get('fov', 0)}}")
 
-def plot_mean_only(csv_file, output_folder, font_family="Arial", font_size=12, figsize=(8,6),
-                   x_min=None, x_max=None, x_tick_interval=None,
-                   y_min=None, y_max=None, y_tick_interval=None,
-                   save_csv=False, csv_output_path=None, dpi=300):
-    """
-    Groups the CSV data by time (only time points â‰¥ 5), computes mean F/Fâ‚€,
-    adjusts the time axis (original 5 becomes 0, etc.) and plots a line graph.
-    """
-    plt.rcParams.update({"font.family": font_family, "font.size": font_size})
-    df = pd.read_csv(csv_file)
-    grouped = df.groupby("Time_min")["F/F0"].mean().reset_index()
-    grouped = grouped[grouped["Time_min"] >= 5].copy()
-    grouped["Adjusted_Time"] = grouped["Time_min"] - 5
-    if save_csv:
-        if csv_output_path is None:
-            base, ext = os.path.splitext(os.path.basename(csv_file))
-            csv_output_path = os.path.join(output_folder, f"{base}_mean_FF0.csv")
-        grouped.to_csv(csv_output_path, index=False)
-        print("Saved grouped CSV data to", os.path.abspath(csv_output_path))
-    
-    x = grouped["Adjusted_Time"]
-    y = grouped["F/F0"]
-    
-    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    ax.plot(x, y, marker="o", label=r"Mean $F/F_0$")
-    ax.set_xlabel("Time (min)")
-    ax.set_ylabel("Mean $F/F_0$ Intensity")
-    ax.set_title("Mean $F/F_0$ Over Time")
-    ax.legend()
-    if x_min is None:
-        x_min = x.min()
-    if x_max is None:
-        x_max = x.max()
-    ax.set_xlim(x_min, x_max)
-    if x_tick_interval is not None:
-        xticks = np.arange(x_min, x_max+1, x_tick_interval)
-        ax.set_xticks(xticks)
-    if y_min is not None or y_max is not None:
-        if y_min is None:
-            y_min = y.min()
-        if y_max is None:
-            y_max = y.max()
-        ax.set_ylim(y_min, y_max)
-    if y_tick_interval is not None:
-        yticks = np.arange(y_min, y_max+y_tick_interval, y_tick_interval)
-        ax.set_yticks(yticks)
-    
-    base_filename = os.path.splitext(os.path.basename(csv_file))[0]
-    out_path = os.path.join(output_folder, f"{base_filename}_mean_FF0_line.png")
-    fig.savefig(out_path, dpi=dpi)
-    plt.show()
-    print("Saved mean-only plot to", os.path.abspath(out_path))
-    return grouped
+# Optional: Add text overlays for region and FOV names
+@viewer.dims.events.current_step.connect
+def update_info(event):
+    # This will update when sliders change
+    current_dims = viewer.dims.current_step
+    if len(current_dims) >= 3:  # Make sure we have enough dimensions
+        region_idx = current_dims[1]
+        fov_idx = current_dims[2]
+        if region_idx < len(region_names) and fov_idx < len(fov_names):
+            region_name = region_names[region_idx]
+            fov_name = fov_names[fov_idx]
+            # Update window title with current region and FOV
+            viewer.title = f"Napari - {{folder_name}} - Region: {{region_name}}, FOV: {{fov_name}}"
 
-def plot_scatter_pre_post_with_ttest(csv_file, output_folder, font_family="Arial", font_size=12, figsize=(8,6),
-                                     x_min=None, x_max=None, y_min=0, y_max=8, y_tick_interval=1,
-                                     marker_color="blue", marker_alpha=0.7, dpi=300):
-    """
-    Creates a scatter plot of F/Fâ‚€ vs. SpikePhase (PreSpike vs PostSpike) from the CSV file.
-    Performs a two-sample t-test and annotates significance if p < 0.05.
-    """
-    plt.rcParams.update({"font.family": font_family, "font.size": font_size})
-    df = pd.read_csv(csv_file)
-    df["SpikePhase"] = np.where(df["Time_min"] <= 9, "PreSpike", "PostSpike")
-    phase_mapping = {"PreSpike": 0, "PostSpike": 1}
-    df["Phase_Num"] = df["SpikePhase"].map(phase_mapping)
+napari.run()
+""")
+        
+        # Launch the script in a separate process
+        subprocess.Popen([sys.executable, launcher_script, temp_file])
     
-    pre_group = df[df["SpikePhase"] == "PreSpike"]["F/F0"]
-    post_group = df[df["SpikePhase"] == "PostSpike"]["F/F0"]
-    t_stat, p_value = ttest_ind(pre_group, post_group, nan_policy='omit')
-    print("t-test: t-statistic = {:.4f}, p-value = {:.4f}".format(t_stat, p_value))
-    
-    jitter = np.random.uniform(-0.1, 0.1, size=len(df))
-    x = df["Phase_Num"] + jitter
-    y = df["F/F0"]
-    
-    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    ax.scatter(x, y, color=marker_color, alpha=marker_alpha)
-    ax.set_xticks([0, 1])
-    ax.set_xticklabels(["PreSpike", "PostSpike"], rotation=0)
-    ax.set_xlabel("")
-    ax.set_xlim(x_min if x_min is not None else -0.5,
-                x_max if x_max is not None else 1.5)
-    ax.set_ylim(y_min, y_max)
-    if y_tick_interval is not None:
-        yticks = np.arange(y_min, y_max+y_tick_interval, y_tick_interval)
-        ax.set_yticks(yticks)
-    
-    ax.set_ylabel(r"$F/F_0$ Intensity")
-    ax.set_title("")
-    
-    if p_value < 0.05:
-        y_range = y_max - y_min
-        annotation_y = y_max - 0.08 * y_range
-        ax.plot([0, 1], [annotation_y, annotation_y], color="black", lw=1)
-        ax.text(0.5, annotation_y + 0.01*y_range, "*", ha="center", va="bottom", 
-                color="black", fontsize=font_size+4)
-    
-    base_filename = os.path.splitext(os.path.basename(csv_file))[0]
-    out_path = os.path.join(output_folder, f"{base_filename}_scatter_FF0_ttest.png")
-    fig.savefig(out_path, dpi=dpi)
-    plt.show()
-    print("Saved scatter plot with t-test to", os.path.abspath(out_path))
-    return df
+    def handle_error(self, error_msg, folder_name):
+        self.label.setText(f'Error loading {{folder_name}}: {{error_msg}}')
 
-def plot_combined_overlay(csv_file, output_folder, font_family="Arial", font_size=12, dpi=300):
-    """
-    Creates a combined figure with three subplots:
-      - Heatmap of F/Fâ‚€.
-      - Mean-only line plot of F/Fâ‚€.
-      - Scatter plot of F/Fâ‚€ vs SpikePhase (with t-test annotation).
-    """
-    heatmap_df = plot_heatmap_from_csv(csv_file, output_folder, contrast_min=1, contrast_max=1.3, cmap='inferno', 
-                                       figsize=(12,8), font_family=font_family, font_size=font_size, dpi=dpi)
-    mean_grouped = plot_mean_only(csv_file, output_folder, font_family=font_family, font_size=font_size, figsize=(8,6),
-                                  save_csv=True, dpi=dpi)
-    scatter_df = plot_scatter_pre_post_with_ttest(csv_file, output_folder, font_family=font_family, font_size=font_size, 
-                                                  figsize=(8,6), marker_color="orange", marker_alpha=0.4, dpi=dpi)
-    
-    fig, axs = plt.subplots(1, 3, figsize=(18, 6), dpi=dpi)
-    
-    # Left: Heatmap
-    n_cells, n_time = heatmap_df.shape
-    heatmap_data = heatmap_df.values
-    im = axs[0].imshow(heatmap_data, aspect='auto', cmap='inferno', interpolation='nearest', vmin=1, vmax=1.3)
-    axs[0].set_xlabel("Time (min)")
-    axs[0].set_ylabel("Cell ID")
-    axs[0].set_title("Heatmap of $F/F_0$")
-    axs[0].set_xticks(np.arange(n_time))
-    axs[0].set_xticklabels(heatmap_df.columns, rotation=0)
-    axs[0].set_yticks([])
-    fig.colorbar(im, ax=axs[0], label=r"$F/F_0$")
-    
-    # Middle: Mean-only line plot
-    x = mean_grouped["Adjusted_Time"]
-    y = mean_grouped["F/F0"]
-    axs[1].plot(x, y, marker="o", label=r"Mean $F/F_0$")
-    axs[1].set_xlabel("Time (min)")
-    axs[1].set_ylabel("Mean $F/F_0$ Intensity")
-    axs[1].set_title("Mean $F/F_0$ Over Time")
-    axs[1].legend()
-    axs[1].set_xlim(x.min(), x.max())
-    
-    # Right: Scatter plot with t-test annotation
-    jitter = np.random.uniform(-0.1, 0.1, size=len(scatter_df))
-    x_scatter = scatter_df["Phase_Num"] + jitter
-    y_scatter = scatter_df["F/F0"]
-    axs[2].scatter(x_scatter, y_scatter, color="orange", alpha=0.4)
-    axs[2].set_xticks([0, 1])
-    axs[2].set_xticklabels(["PreSpike", "PostSpike"], rotation=0)
-    axs[2].set_xlabel("")
-    axs[2].set_xlim(-0.5, 1.5)
-    axs[2].set_ylabel(r"$F/F_0$ Intensity")
-    pre_group = scatter_df[scatter_df["SpikePhase"] == "PreSpike"]["F/F0"]
-    post_group = scatter_df[scatter_df["SpikePhase"] == "PostSpike"]["F/F0"]
-    t_stat, p_value = ttest_ind(pre_group, post_group, nan_policy='omit')
-    if p_value < 0.05:
-        y_range = (y_scatter.max() - y_scatter.min())
-        annotation_y = y_scatter.max() + 0.05 * y_range
-        axs[2].plot([0, 1], [annotation_y, annotation_y], color="black", lw=1)
-        axs[2].text(0.5, annotation_y + 0.01*y_range, "*", ha="center", va="bottom", 
-                    color="black", fontsize=font_size+4)
-    axs[2].set_title("Scatter of $F/F_0$ (t-test p={:.4f})".format(p_value))
-    
-    fig.tight_layout()
-    base_filename = os.path.splitext(os.path.basename(csv_file))[0]
-    combined_out = os.path.join(output_folder, f"{base_filename}_combined_overlay.png")
-    fig.savefig(combined_out, dpi=dpi)
-    plt.show()
-    print("Saved combined overlay figure to", os.path.abspath(combined_out))
 
-##############################
-# Main Pipeline Execution (Adapted for TIFF)
-##############################
 if __name__ == "__main__":
-    # Set your main input folder containing timepoint subdirectories.
-    main_input_folder = "/home/cephla/Downloads/response_GABA_2025-04-25_15-47-20.017959"  # modify as needed
-
-    # Step 1: Generate z-max projections.
-    print("=== Generating z-max projections ===")
-    zmax_projection(main_input_folder)
+    # Create PyQt application
+    app = QApplication(sys.argv)
     
-    # Define zmax folder (created in step 1).
-    zmax_folder = os.path.join(main_input_folder, "zmax")
+    # Create and show the directory selector
+    selector = DirectorySelector()
+    selector.show()
     
-    # Step 2: Run Cellpose segmentation on the z-max TIFFs.
-    print("=== Running Cellpose segmentation ===")
-    run_cellpose_segmentation_cyto2(
-        input_folder=zmax_folder,
-        channels=(0, 0),
-        diameter=None,
-        flow_threshold=0.4,
-        cellprob_threshold=0.0,
-        gpu=True  # Set to True if you have a GPU available.
-    )
-    
-    # Step 3: Process each FOV with its corresponding mask.
-    # CSV files will be saved in an "output" folder inside the main input folder.
-    output_dir = os.path.join(main_input_folder, "output")
-    os.makedirs(output_dir, exist_ok=True)
-    baseline_times = [5, 6, 7, 8]
-    
-    # Get all zmax files
-    zmax_files = glob.glob(os.path.join(zmax_folder, "*_zmax.tif"))
-    if not zmax_files:
-        print("No zmax files found in", zmax_folder)
-    else:
-        for zmax_file in tqdm(zmax_files, desc="Processing FOVs for intensity extraction"):
-            base_name = os.path.splitext(os.path.basename(zmax_file))[0]
-            fov_key = base_name.replace("_zmax", "")  # e.g., "B2_0"
-            
-            # Construct the mask file path.
-            # Assumes the mask file is named: [base_name]_mask_cyto2.tif in zmax/mask_cyto2.
-            mask_filename = base_name + "_mask_cyto2.tif"
-            mask_file = os.path.join(zmax_folder, "mask_cyto2", mask_filename)
-            if not os.path.exists(mask_file):
-                print(f"Mask file not found for {zmax_file} at {mask_file}")
-                continue
-            process_pair(main_input_folder, mask_file, output_dir, fov_key, 
-                        channel="488", baseline_times=baseline_times)
-    
-    # Step 4: Plot analysis from CSV files.
-    analysis_outputs_folder = os.path.join(output_dir, "analysis_outputs")
-    os.makedirs(analysis_outputs_folder, exist_ok=True)
-    csv_files = glob.glob(os.path.join(output_dir, "*.csv"))
-    if not csv_files:
-        print("No CSV files found in", output_dir)
-    else:
-        for csv_file in tqdm(csv_files, desc="Plotting analysis from CSV files"):
-            print("=== Processing CSV file:", csv_file, "===")
-            plot_heatmap_from_csv(csv_file, analysis_outputs_folder, contrast_min=1, contrast_max=1.3,
-                                  cmap='coolwarm', figsize=(12,8), font_family="Arial", font_size=12, dpi=300)
-            plot_mean_only(csv_file, analysis_outputs_folder, font_family="Arial", font_size=12, figsize=(8,6),
-                           x_min=0, x_max=10, x_tick_interval=1,
-                           y_min=0.9, y_max=1.4, y_tick_interval=0.1,
-                           save_csv=True, dpi=300)
-            plot_scatter_pre_post_with_ttest(csv_file, analysis_outputs_folder, font_family="Arial", font_size=12,
-                                             figsize=(4, 8), x_min=-0.5, x_max=1.5,
-                                             y_min=0, y_max=9, y_tick_interval=1,
-                                             marker_color="orange", marker_alpha=0.4, dpi=300)
-            plot_combined_overlay(csv_file, analysis_outputs_folder, font_family="Arial", font_size=12, dpi=300)
+    # Run the application
+    sys.exit(app.exec())

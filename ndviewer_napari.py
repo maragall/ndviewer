@@ -17,9 +17,11 @@ from PyQt6.QtCore import QObject, pyqtSignal, QThread, Qt
 # Import the downsampler module
 try:
     from downsampler import DownsampledNavigator
-except ImportError:
-    print("Warning: downsampler module not found. Navigator will be disabled.")
-    DownsampledNavigator = None
+    NAVIGATOR_AVAILABLE = True
+    print("Successfully imported downsampler module")
+except ImportError as e:
+    print(f"Warning: downsampler module not found: {e}")
+    NAVIGATOR_AVAILABLE = False
 
 def create_tiff_zarr_map(input_dir, coordinate_csv=None, acquisition_params_json=None, configurations_xml=None):
     """
@@ -380,7 +382,7 @@ class DirectorySelector(QDialog):
         launcher_script = os.path.join(tempfile.gettempdir(), f"napari_launcher_{os.getpid()}_{hash(folder_name)}.py")
         
         with open(launcher_script, 'w') as f:
-            f.write("""
+            f.write(f"""
 import os
 import sys
 import pickle
@@ -390,16 +392,18 @@ import dask
 import tifffile
 import numpy as np
 from napari.layers import Image
-from vispy.scene.visuals import Rectangle
-from vispy.scene import PanZoomCamera
+from pathlib import Path
+
+# Add the directory containing downsampler to Python path
+sys.path.insert(0, r'{os.path.dirname(os.path.abspath(__file__))}')
 
 # Try to import downsampler
 try:
-    sys.path.insert(0, os.path.dirname('""" + os.path.abspath(__file__) + """'))
     from downsampler import DownsampledNavigator
     NAVIGATOR_AVAILABLE = True
-except ImportError:
-    print("Warning: Navigator module not available")
+    print("Successfully imported downsampler module in launcher")
+except ImportError as e:
+    print(f"Warning: Navigator module not available in launcher: {{e}}")
     NAVIGATOR_AVAILABLE = False
 
 # Load the metadata from the temp file
@@ -410,10 +414,16 @@ directory = data['directory']
 metadata = data['metadata']
 folder_name = data['folder_name']
 
+print(f"Launching napari for: {{folder_name}}")
+print(f"Directory: {{directory}}")
+print(f"Navigator available: {{NAVIGATOR_AVAILABLE}}")
+
 # Get dimensions
 dims = metadata['dimensions']
 file_map = metadata['file_map']
 acq_params = metadata['acquisition_parameters']
+
+print(f"Dimensions: {{dims}}")
 
 # Calculate pixel size in microns
 pixel_size_um = None
@@ -425,12 +435,12 @@ if acq_params:
         sensor_pixel_size = acq_params['sensor_pixel_size_um']
         magnification = acq_params['objective']['magnification']
         pixel_size_um = sensor_pixel_size / magnification
-        print(f"Calculated pixel size: {pixel_size_um:.3f} µm")
+        print(f"Calculated pixel size: {{pixel_size_um:.3f}} µm")
     
     # Get Z step size
     if 'dz(um)' in acq_params:
         z_step_um = acq_params['dz(um)']
-        print(f"Z step size: {z_step_um} µm")
+        print(f"Z step size: {{z_step_um}} µm")
 
 # Default values if not found in parameters
 if pixel_size_um is None:
@@ -476,13 +486,17 @@ for t in range(dims['time']):
 dask_data = da.stack(lazy_arrays)
 
 # Display the data using napari
-print(f"Opening napari viewer for: {folder_name}")
-viewer = napari.Viewer(title=f"Napari - {folder_name}")
+print(f"Opening napari viewer for: {{folder_name}}")
+viewer = napari.Viewer(title=f"Napari - {{folder_name}}")
 
 # The dimensions are: (t, c, r, f, z, y, x)
 channel_names = metadata['channels']
 region_names = metadata['regions']
 fov_names = metadata['fovs']
+
+print(f"Channel names: {{channel_names}}")
+print(f"Region names: {{region_names}}")
+print(f"FOV names: {{fov_names}}")
 
 # Calculate scale for each dimension
 # [time, region, fov, z, y, x]
@@ -497,7 +511,7 @@ for c in range(dims['channel']):
     channel_data = dask_data[:, c, :, :, :, :, :]
     
     # Create a meaningful name for the layer
-    layer_name = f"Channel: {channel_names[c]}"
+    layer_name = f"Channel: {{channel_names[c]}}"
     
     # Add to viewer with appropriate dimension labels and scale
     viewer.add_image(
@@ -509,9 +523,9 @@ for c in range(dims['channel']):
         # Define dimension names for sliders
         # The order should match the dimensions in the array
         multiscale=False,
-        metadata={
+        metadata={{
             'dimension_names': ['Time', 'Region', 'FOV', 'Z', 'Y', 'X']
-        }
+        }}
     )
 
 # Set dimension labels for the sliders
@@ -529,125 +543,217 @@ if NAVIGATOR_AVAILABLE and dims['region'] > 0 and dims['fov'] > 0:
     try:
         # Create navigator with progress callback
         def progress_callback(percent, message):
-            print(f"Navigator: {percent}% - {message}")
+            print(f"Navigator: {{percent}}% - {{message}}")
         
         navigator = DownsampledNavigator(
-            directory, 
-            tile_size=50,
+            Path(directory), 
+            tile_size=75,  # Good balance of quality and speed
             cache_enabled=True,
             progress_callback=progress_callback
         )
         
         # Create mosaic for current timepoint
         current_time = viewer.dims.current_step[0] if viewer.dims.current_step else 0
+        print(f"Creating navigator mosaic for timepoint {{current_time}}")
+        
         mosaic_array, nav_metadata = navigator.create_mosaic(current_time)
         
-        # Add navigator as an overlay layer
-        nav_layer = viewer.add_image(
-            mosaic_array,
-            name='Navigator',
-            opacity=1.0,  # Fully opaque, no translucency
-            colormap='gray',
-            visible=True,
-            scale=(1, 1),  # Navigator has its own coordinate system
-            translate=(0, 0),
-            metadata=nav_metadata,
-            contrast_limits=(0, 255),  # Full contrast range for brightness
-            gamma=0.8  # Lower gamma for brighter appearance
-        )
+        print(f"Navigator mosaic created: shape={{mosaic_array.shape}}, range={{mosaic_array.min()}}-{{mosaic_array.max()}}")
+        print(f"Non-zero pixels: {{np.count_nonzero(mosaic_array)}}")
         
-        # Position navigator to the side of the main data, not overlapping
-        # Calculate offset to place navigator to the right side of the main data
-        main_data_width = dims['x']  # Width of individual tiles
-        main_data_height = dims['y']  # Height of individual tiles
-        
-        # Position navigator to the right side with some padding
-        nav_offset_x = main_data_width + 200  # 200 pixel padding
-        nav_offset_y = 0  # Keep at same Y level
-        
-        nav_layer.translate = (nav_offset_y, nav_offset_x)
-        
-        # Make navigator interactive for clicking
-        nav_layer.interactive = True
-        
-        # Function to handle clicks on navigator
-        @nav_layer.mouse_drag_callbacks.append
-        def on_navigator_click(layer, event):
-            if event.button == 1:  # Left click
-                # Get click position in the navigator layer's coordinate system
-                pos = event.position
-                if len(pos) >= 2:
-                    # The position is in the navigator's coordinate system
-                    click_y, click_x = pos[-2], pos[-1]  # Get Y, X coordinates
-                    
-                    # Subtract the navigator's offset to get position relative to navigator image
-                    click_x -= nav_offset_x
-                    click_y -= nav_offset_y
-                    
-                    # Convert to grid coordinates
-                    tile_size = nav_metadata['tile_size']
-                    col = int(click_x / tile_size)
-                    row = int(click_y / tile_size)
-                    
-                    # Find the corresponding FOV
-                    fov_grid = nav_metadata['fov_grid']
-                    if (row, col) in fov_grid:
-                        region_name, fov_num = fov_grid[(row, col)]
+        # Ensure the mosaic has data
+        if np.count_nonzero(mosaic_array) == 0:
+            print("WARNING: Navigator mosaic is empty! Skipping navigator.")
+        else:
+            print("Navigator mosaic has data, proceeding with display...")
+            
+            # Add navigator as an overlay layer
+            nav_layer = viewer.add_image(
+                mosaic_array,
+                name='Navigator',
+                opacity=1.0,  # Fully opaque
+                colormap='gray',
+                visible=True,
+                scale=(1, 1),  # Navigator has its own coordinate system
+                translate=(0, 0),  # Start at origin, we'll position it after
+                metadata=nav_metadata,
+                contrast_limits=(0, 255),  # Full contrast range
+                gamma=0.8  # Lower gamma for brighter appearance
+            )
+            
+            print(f"Navigator layer added: {{nav_layer.name}}")
+            
+            # Position navigator at outer top-right edge of actual FOV image
+            # Use napari's extent property to get actual world coordinate bounds
+            
+            print("=== NAVIGATOR POSITIONING ===")
+            
+            # Find the main FOV image layer to get its actual bounds
+            main_image_layer = None
+            for layer in viewer.layers:
+                if hasattr(layer, 'data') and 'Channel:' in layer.name:
+                    main_image_layer = layer
+                    break
+            
+            if main_image_layer:
+                # Get the actual world coordinate bounds using napari's extent property
+                extent = main_image_layer.extent
+                print(f"Main layer extent: {{extent}}")
+                
+                # extent.world gives us the actual world coordinate bounds: 
+                # [[min_coords], [max_coords]] for all dimensions
+                world_bounds = extent.world
+                print(f"World bounds: {{world_bounds}}")
+                
+                # For positioning, we need the last two dimensions (Y, X)
+                # world_bounds shape is (2, ndim) where [0] is min coords, [1] is max coords
+                fov_right = world_bounds[1, -1]  # Max X coordinate (right edge)
+                fov_top = world_bounds[0, -2]    # Min Y coordinate (top edge)
+                
+                print(f"FOV right edge (X): {{fov_right}}")
+                print(f"FOV top edge (Y): {{fov_top}}")
+                
+            else:
+                print("No main image layer found, using fallback")
+                # Fallback to metadata approach
+                fov_right = dims.get('x', 5000)
+                fov_top = 0
+            
+            # Position navigator just outside the right edge
+            nav_height, nav_width = mosaic_array.shape
+            gap = 1
+            
+            nav_x_position = fov_right + gap  # RIGHT EDGE + gap
+            nav_y_position = fov_top + gap    # TOP EDGE + gap
+            
+            print(f"Navigator position: x={{nav_x_position}}, y={{nav_y_position}}")
+            print("=== END POSITIONING ===")
+            
+            nav_layer.translate = (nav_y_position, nav_x_position)
+            
+            # Add a simple bounding box around the navigator
+            nav_border_coords = [
+                [nav_y_position, nav_x_position],  # Top-left
+                [nav_y_position, nav_x_position + nav_width],  # Top-right
+                [nav_y_position + nav_height, nav_x_position + nav_width],  # Bottom-right
+                [nav_y_position + nav_height, nav_x_position]  # Bottom-left
+            ]
+            
+            nav_border_layer = viewer.add_shapes(
+                [nav_border_coords],
+                shape_type='rectangle',
+                edge_color='white',
+                face_color='transparent',
+                edge_width=2,
+                name='Navigator Border',
+                opacity=1.0
+            )
+            
+            # Make the border non-interactive
+            nav_border_layer.interactive = False
+            nav_border_layer.editable = False
+            nav_border_layer.mouse_pan = False
+            nav_border_layer.mouse_zoom = False
+            
+            # Make navigator interactive for clicking
+            nav_layer.interactive = True
+            
+            # Function to handle clicks on navigator - simplified coordinate handling
+            @nav_layer.mouse_drag_callbacks.append
+            def on_navigator_click(layer, event):
+                if event.button == 1:  # Left click
+                    # Get click position - this is in the viewer's coordinate system
+                    pos = event.position
+                    if len(pos) >= 2:
+                        viewer_click_y, viewer_click_x = pos[-2], pos[-1]
                         
-                        # Find indices in the main viewer
-                        if region_name in region_names and fov_num in fov_names:
-                            region_idx = region_names.index(region_name)
-                            fov_idx = fov_names.index(fov_num)
+                        # Convert to navigator-local coordinates by subtracting navigator position
+                        nav_y_pos, nav_x_pos = nav_layer.translate
+                        nav_local_x = viewer_click_x - nav_x_pos
+                        nav_local_y = viewer_click_y - nav_y_pos
+                        
+                        # Check if click is within navigator bounds
+                        if (0 <= nav_local_x < nav_width and 0 <= nav_local_y < nav_height):
+                            # Convert to grid coordinates
+                            tile_size = nav_metadata['tile_size']
+                            grid_col = int(nav_local_x / tile_size)
+                            grid_row = int(nav_local_y / tile_size)
                             
-                            # Update viewer dimensions to jump to this FOV
-                            current = list(viewer.dims.current_step)
-                            if len(current) >= 3:
-                                current[1] = region_idx  # Region dimension
-                                current[2] = fov_idx     # FOV dimension
-                                viewer.dims.current_step = current
-                                print(f"Jumped to Region: {region_name}, FOV: {fov_num}")
-        
-        # Create a red box overlay for current view
-        # Instead of using vispy directly, use napari shapes layer for the overlay
-        nav_box_layer = None
-        
-        # Function to update navigator box based on current view
-        def update_navigator_box():
-            global nav_box_layer
-            try:
-                # Get current FOV and region from sliders
-                current_step = viewer.dims.current_step
-                if len(current_step) >= 3:
-                    region_idx = current_step[1]
-                    fov_idx = current_step[2]
-                    
-                    # Get the actual region and fov names
-                    if region_idx < len(region_names) and fov_idx < len(fov_names):
-                        region_name = region_names[region_idx]
-                        fov_name = fov_names[fov_idx]
-                        
-                        # Find this FOV in the navigator metadata
-                        fov_grid = nav_metadata['fov_grid']
-                        tile_size = nav_metadata['tile_size']
-                        
-                        # Find the grid position of this FOV
-                        for (row, col), (nav_region, nav_fov) in fov_grid.items():
-                            if nav_region == region_name and nav_fov == fov_name:
-                                # Calculate pixel position in navigator (relative to navigator's coordinate system)
-                                nav_x = col * tile_size + tile_size // 2
-                                nav_y = row * tile_size + tile_size // 2
+                            print(f"Navigator click: viewer({{viewer_click_x}}, {{viewer_click_y}}) -> nav_local({{nav_local_x}}, {{nav_local_y}}) -> grid({{grid_row}}, {{grid_col}})")
+                            
+                            # Find the corresponding FOV
+                            fov_grid = nav_metadata.get('fov_grid', {{}})
+                            if (grid_row, grid_col) in fov_grid:
+                                clicked_fov = fov_grid[(grid_row, grid_col)]
+                                clicked_region = nav_metadata.get('regions', {{}}).get(clicked_fov, 'unknown')
                                 
-                                # Account for navigator's translation offset
-                                nav_x += nav_offset_x
-                                nav_y += nav_offset_y
+                                print(f"Clicked FOV: {{clicked_fov}}, Region: {{clicked_region}}")
+                                
+                                # Find indices in the main viewer
+                                try:
+                                    region_idx = region_names.index(clicked_region) if clicked_region in region_names else None
+                                    fov_idx = fov_names.index(clicked_fov) if clicked_fov in fov_names else None
+                                    
+                                    if region_idx is not None and fov_idx is not None:
+                                        # Update viewer dimensions to jump to this FOV
+                                        current = list(viewer.dims.current_step)
+                                        if len(current) >= 3:
+                                            current[1] = region_idx  # Region dimension
+                                            current[2] = fov_idx     # FOV dimension
+                                            viewer.dims.current_step = current
+                                            print(f"Jumped to Region: {{clicked_region}} (idx={{region_idx}}), FOV: {{clicked_fov}} (idx={{fov_idx}})")
+                                    else:
+                                        print(f"Could not find indices for region/FOV: {{clicked_region}}/{{clicked_fov}}")
+                                        
+                                except Exception as e:
+                                    print(f"Error in navigator click handling: {{e}}")
+                            else:
+                                print(f"No FOV found at grid position ({{grid_row}}, {{grid_col}})")
+                        else:
+                            print(f"Click outside navigator bounds: nav_local({{nav_local_x}}, {{nav_local_y}})")
+            
+            # Create navigator box overlay
+            nav_box_layer = None
+            
+            # Function to update navigator box - simplified positioning
+            def update_navigator_box():
+                global nav_box_layer
+                try:
+                    # Get current FOV and region from sliders
+                    current_step = viewer.dims.current_step
+                    if len(current_step) >= 3:
+                        region_idx = current_step[1]
+                        fov_idx = current_step[2]
+                        
+                        # Get the actual region and fov names
+                        if region_idx < len(region_names) and fov_idx < len(fov_names):
+                            region_name = region_names[region_idx]
+                            fov_name = fov_names[fov_idx]
+                            
+                            # Find this FOV in the navigator grid
+                            fov_to_grid = nav_metadata.get('fov_to_grid_pos', {{}})
+                            
+                            if fov_name in fov_to_grid:
+                                grid_row, grid_col = fov_to_grid[fov_name]
+                                tile_size = nav_metadata['tile_size']
+                                
+                                # Calculate position in viewer coordinates
+                                # Start with grid position in navigator-local coordinates
+                                nav_local_x = grid_col * tile_size + tile_size // 2
+                                nav_local_y = grid_row * tile_size + tile_size // 2
+                                
+                                # Convert to viewer coordinates by adding navigator position
+                                nav_y_pos, nav_x_pos = nav_layer.translate
+                                viewer_x = nav_local_x + nav_x_pos
+                                viewer_y = nav_local_y + nav_y_pos
                                 
                                 # Create a rectangle shape for the box
                                 box_size = tile_size * 0.8
                                 box_coords = [
-                                    [nav_y - box_size//2, nav_x - box_size//2],
-                                    [nav_y - box_size//2, nav_x + box_size//2],
-                                    [nav_y + box_size//2, nav_x + box_size//2],
-                                    [nav_y + box_size//2, nav_x - box_size//2]
+                                    [viewer_y - box_size//2, viewer_x - box_size//2],
+                                    [viewer_y - box_size//2, viewer_x + box_size//2],
+                                    [viewer_y + box_size//2, viewer_x + box_size//2],
+                                    [viewer_y + box_size//2, viewer_x - box_size//2]
                                 ]
                                 
                                 # Remove existing box layer if it exists
@@ -660,82 +766,70 @@ if NAVIGATOR_AVAILABLE and dims['region'] > 0 and dims['fov'] > 0:
                                     shape_type='rectangle',
                                     edge_color='red',
                                     face_color='transparent',
-                                    edge_width=2,
+                                    edge_width=3,
                                     name='Navigator Box',
-                                    opacity=0.8
+                                    opacity=1.0
                                 )
                                 
-                                # Make the red box non-interactive and hide from layer list
+                                # Make the red box non-interactive and prevent selection
                                 nav_box_layer.interactive = False
                                 nav_box_layer.visible = True
-                                
-                                # Additional properties to minimize user interaction
                                 nav_box_layer.editable = False
                                 nav_box_layer.mouse_pan = False
                                 nav_box_layer.mouse_zoom = False
                                 
-                                # Try to hide it from layer controls (this might not work in all napari versions)
-                                try:
-                                    nav_box_layer._layer_controls_visible = False
-                                except:
-                                    pass
+                                # Force selection back to navigator layer immediately
+                                viewer.layers.selection.active = nav_layer
                                 
-                                # Force the navigator box to the very top (highest index = top layer)
-                                # Move it to the top AFTER all properties are set
-                                current_index = viewer.layers.index(nav_box_layer)
-                                viewer.layers.move(current_index, len(viewer.layers) - 1)
+                                print(f"Updated navigator box for FOV {{fov_name}} at grid({{grid_row}}, {{grid_col}}) -> viewer({{viewer_x}}, {{viewer_y}})")
+                            else:
+                                print(f"FOV {{fov_name}} not found in navigator grid mapping")
                                 
-                                # Force selection back to navigator layer to prevent box selection
-                                try:
-                                    viewer.layers.selection.active = nav_layer
-                                except:
-                                    pass  # In case there's an issue with selection
-                                
-                                break
-            except Exception as e:
-                print(f"Error updating navigator box: {e}")
-        
-        # Connect the update function to dimension changes
-        viewer.dims.events.current_step.connect(update_navigator_box)
-        
-        # Also update on camera changes (pan/zoom)
-        viewer.camera.events.zoom.connect(update_navigator_box)
-        viewer.camera.events.center.connect(update_navigator_box)
-        
-        # Initial update
-        update_navigator_box()
-        
-        # Add layer selection event handler to prevent navigator box selection
-        @viewer.layers.selection.events.active.connect
-        def on_layer_selection_changed(event):
-            # If navigator box is selected, switch back to navigator
-            if (hasattr(event, 'value') and event.value is not None and 
-                hasattr(event.value, 'name') and event.value.name == 'Navigator Box'):
+                except Exception as e:
+                    print(f"Error updating navigator box: {{e}}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Connect the update function to dimension changes
+            viewer.dims.events.current_step.connect(update_navigator_box)
+            
+            # Add layer selection event handler to prevent navigator box selection
+            @viewer.layers.selection.events.active.connect
+            def on_layer_selection_changed(event):
+                # If navigator box is selected, immediately switch back to navigator
+                if (hasattr(event, 'value') and event.value is not None and 
+                    hasattr(event.value, 'name') and event.value.name == 'Navigator Box'):
+                    try:
+                        viewer.layers.selection.active = nav_layer
+                        print("Prevented Navigator Box selection, switched back to Navigator")
+                    except Exception as e:
+                        print(f"Error switching back to navigator layer: {{e}}")
+            
+            # Add event listener to handle new layer insertions
+            @viewer.layers.events.inserted.connect
+            def on_layer_inserted(event):
+                # Always keep navigator as the active layer for interaction
                 try:
-                    viewer.layers.selection.active = nav_layer
-                except:
-                    pass
-        
-        # Add event listener to keep navigator box on top when new layers are added
-        @viewer.layers.events.inserted.connect
-        def on_layer_inserted(event):
-            # Keep navigator box on top whenever a new layer is added
-            global nav_box_layer
-            if nav_box_layer is not None and nav_box_layer in viewer.layers:
-                try:
-                    current_index = viewer.layers.index(nav_box_layer)
-                    top_index = len(viewer.layers) - 1
-                    if current_index != top_index:  # If not already at top
-                        viewer.layers.move(current_index, top_index)
-                except:
-                    pass
-        
-        print("Navigator overlay created successfully!")
-        
+                    if nav_layer in viewer.layers:
+                        viewer.layers.selection.active = nav_layer
+                except Exception as e:
+                    print(f"Error maintaining navigator selection: {{e}}")
+            
+            # Initial update
+            update_navigator_box()
+            
+            print("Navigator overlay created successfully!")
+            
     except Exception as e:
-        print(f"Failed to create navigator: {e}")
+        print(f"Failed to create navigator: {{e}}")
         import traceback
         traceback.print_exc()
+
+else:
+    if not NAVIGATOR_AVAILABLE:
+        print("Navigator not available - module not imported")
+    else:
+        print(f"Navigator conditions not met: regions={{dims.get('region', 0)}}, fovs={{dims.get('fov', 0)}}")
 
 # Optional: Add text overlays for region and FOV names
 @viewer.dims.events.current_step.connect
@@ -749,7 +843,7 @@ def update_info(event):
             region_name = region_names[region_idx]
             fov_name = fov_names[fov_idx]
             # Update window title with current region and FOV
-            viewer.title = f"Napari - {folder_name} - Region: {region_name}, FOV: {fov_name}"
+            viewer.title = f"Napari - {{folder_name}} - Region: {{region_name}}, FOV: {{fov_name}}"
 
 napari.run()
 """)
@@ -758,7 +852,7 @@ napari.run()
         subprocess.Popen([sys.executable, launcher_script, temp_file])
     
     def handle_error(self, error_msg, folder_name):
-        self.label.setText(f'Error loading {folder_name}: {error_msg}')
+        self.label.setText(f'Error loading {{folder_name}}: {{error_msg}}')
 
 
 if __name__ == "__main__":

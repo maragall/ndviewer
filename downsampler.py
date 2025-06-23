@@ -1,3 +1,8 @@
+
+# =====================================================
+# DOWNSAMPLER.PY
+# =====================================================
+
 #!/usr/bin/env python3
 """
 Downsampler module for creating fast preview mosaics.
@@ -13,15 +18,16 @@ import tifffile as tf
 from PIL import Image
 import threading
 
-# Pattern for acquisitions: {region}_{fov}_{z}_Fluorescence_{wavelength}_nm_Ex.tiff
+# Pattern for acquisitions: {region}_{fov}_{z_layer}_{imaging_modality}_{channel_info}_{suffix}.tiff
+# Examples: C5_0_0_Fluorescence_405_nm_Ex.tiff, D6_2_3_Brightfield_BF_Ex.tiff
 FPATTERN = re.compile(
-    r"([^_]+)_(\d+)_(\d+)_Fluorescence_(\d+)_nm_Ex\.tiff?", re.IGNORECASE
+    r"(?P<region>[^_]+)_(?P<fov>\d+)_(?P<z>\d+)_(?P<modality>[^_]+)_(?P<channel>[^_]+)_.*\.tiff?", re.IGNORECASE
 )
 
 class DownsampledNavigator:
     """Fast downsampled mosaic generator for navigation."""
     
-    def __init__(self, acquisition_dir: Path, tile_size: int = 50, 
+    def __init__(self, acquisition_dir: Path, tile_size: int = 75,
                  cache_enabled: bool = True, progress_callback: Optional[Callable] = None):
         """
         Initialize the navigator.
@@ -31,7 +37,7 @@ class DownsampledNavigator:
         acquisition_dir : Path
             Root directory of the acquisition
         tile_size : int
-            Size of each tile in pixels (smaller = faster)
+            Size of each tile in pixels (75 for good balance of speed/quality)
         cache_enabled : bool
             Whether to use caching
         progress_callback : Callable
@@ -44,10 +50,10 @@ class DownsampledNavigator:
         
         # Data storage
         self.coordinates = {}  # {fov: (x_mm, y_mm)}
-        self.regions = {}  # {fov: region}
+        self.regions = {}      # {fov: region_name} - Added back for compatibility
         self.channels = []
-        self.file_map = {}  # {(channel, region, fov): filepath}
-        self.fov_grid = {}  # {(row, col): (region, fov)}
+        self.file_map = {}     # {(channel, fov): [filepath, ...]}
+        self.fov_grid = {}     # {(row, col): fov}
         self.grid_dims = (0, 0)
         self.grid_bounds = None  # (x_min, x_max, y_min, y_max) in mm
         
@@ -57,7 +63,7 @@ class DownsampledNavigator:
             self.cache_dir.mkdir(exist_ok=True)
         else:
             self.cache_dir = None
-            
+    
     def create_mosaic(self, timepoint: int = 0) -> Tuple[np.ndarray, Dict]:
         """
         Create a downsampled mosaic for the specified timepoint.
@@ -69,11 +75,23 @@ class DownsampledNavigator:
         metadata : dict
             Metadata including grid info and coordinate mappings
         """
-        # Find timepoint directory
-        timepoint_dir = self.acquisition_dir / str(timepoint)
-        if not timepoint_dir.exists():
-            raise ValueError(f"Timepoint directory {timepoint_dir} not found")
-            
+        # Find timepoint directory - match grid viewer approach
+        timepoint_dirs = []
+        for item in self.acquisition_dir.iterdir():
+            if item.is_dir() and item.name.isdigit():
+                timepoint_dirs.append(item)
+        
+        if not timepoint_dirs:
+            raise ValueError(f"No timepoint directories found in {self.acquisition_dir}")
+        
+        # Use first timepoint if specific one not found
+        if timepoint == 0 or not (self.acquisition_dir / str(timepoint)).exists():
+            timepoint_dir = sorted(timepoint_dirs, key=lambda x: int(x.name))[0]
+        else:
+            timepoint_dir = self.acquisition_dir / str(timepoint)
+        
+        print(f"[NAVIGATOR] Using timepoint directory: {timepoint_dir}")
+        
         # Load coordinates
         self._report_progress(5, "Loading coordinates...")
         self._load_coordinates(timepoint_dir)
@@ -90,7 +108,7 @@ class DownsampledNavigator:
         self._report_progress(20, "Creating mosaic...")
         mosaic_array = self._create_mosaic_array()
         
-        # Build metadata
+        # Build metadata for napari integration
         metadata = {
             'grid_dims': self.grid_dims,
             'tile_size': self.tile_size,
@@ -99,113 +117,173 @@ class DownsampledNavigator:
             'regions': self.regions,
             'channels': self.channels,
             'grid_bounds': self.grid_bounds,
-            'pixel_to_mm_scale': self._calculate_pixel_to_mm_scale()
+            'pixel_to_mm_scale': self._calculate_pixel_to_mm_scale(),
+            # Add mapping for napari integration
+            'fov_to_grid_pos': self._create_fov_to_grid_mapping(),
+            'region_fov_mapping': self._create_region_fov_mapping()
         }
         
         self._report_progress(100, "Complete!")
         return mosaic_array, metadata
     
+    def _create_fov_to_grid_mapping(self) -> Dict[int, Tuple[int, int]]:
+        """Create mapping from FOV number to grid position."""
+        fov_to_pos = {}
+        for (row, col), fov in self.fov_grid.items():
+            fov_to_pos[fov] = (row, col)
+        return fov_to_pos
+    
+    def _create_region_fov_mapping(self) -> Dict[Tuple[str, int], Tuple[int, int]]:
+        """Create mapping from (region_name, fov_num) to grid position."""
+        region_fov_to_pos = {}
+        for (row, col), fov in self.fov_grid.items():
+            region_name = self.regions.get(fov, 'unknown')
+            region_fov_to_pos[(region_name, fov)] = (row, col)
+        return region_fov_to_pos
+    
     def _report_progress(self, percent: int, message: str):
         """Report progress if callback is available."""
         if self.progress_callback:
             self.progress_callback(percent, message)
+        print(f"[NAVIGATOR] {percent}% - {message}")
     
     def _load_coordinates(self, timepoint_dir: Path):
-        """Load FOV coordinates and regions from CSV."""
+        """Load FOV coordinates from CSV - matches grid viewer exactly."""
         coord_file = timepoint_dir / "coordinates.csv"
         if not coord_file.exists():
             raise FileNotFoundError(f"coordinates.csv not found in {timepoint_dir}")
-            
+        
         self.coordinates.clear()
         self.regions.clear()
         
-        with open(coord_file, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                fov = int(row['fov'])
-                x_mm = float(row['x (mm)'])
-                y_mm = float(row['y (mm)'])
-                region = row.get('region', 'default')
-                
-                self.coordinates[fov] = (x_mm, y_mm)
-                self.regions[fov] = region
+        try:
+            with open(coord_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    fov = int(row['fov'])
+                    x_mm = float(row['x (mm)'])
+                    y_mm = float(row['y (mm)'])
+                    # Try to get region from CSV, default to 'default' if not present
+                    region = row.get('region', 'default')
+                    
+                    self.coordinates[fov] = (x_mm, y_mm)
+                    self.regions[fov] = region
+            
+            print(f"[NAVIGATOR] Loaded {len(self.coordinates)} FOV coordinates")
+            print(f"[NAVIGATOR] Regions found: {set(self.regions.values())}")
+            
+        except Exception as e:
+            print(f"[NAVIGATOR ERROR] Failed to load coordinates: {e}")
+            raise
     
     def _scan_files(self, timepoint_dir: Path):
-        """Scan directory for TIFF files."""
+        """Scan directory for TIFF files - matches grid viewer logic exactly."""
+        print(f"[NAVIGATOR] Scanning {timepoint_dir} for TIFF files")
+        
         self.file_map.clear()
         self.channels = set()
         
+        # Find all TIFF files
         tiff_files = list(timepoint_dir.glob("*.tif")) + list(timepoint_dir.glob("*.tiff"))
+        print(f"[NAVIGATOR] Found {len(tiff_files)} TIFF files")
         
         for filepath in tiff_files:
-            match = FPATTERN.match(filepath.name)
+            match = FPATTERN.search(filepath.name)
             if not match:
+                print(f"[NAVIGATOR WARNING] File doesn't match pattern: {filepath.name}")
                 continue
                 
-            region, fov, z, wavelength = match.groups()
-            fov = int(fov)
-            channel = f"{wavelength}nm"
+            region = match.group("region")
+            fov = int(match.group("fov"))
+            z_layer = int(match.group("z"))
+            modality = match.group("modality")
+            channel_info = match.group("channel")
+            
+            # Create a comprehensive channel identifier - exactly like grid viewer
+            if modality.lower() == "fluorescence":
+                # For fluorescence, use the wavelength/channel info
+                channel = f"{channel_info}"
+            else:
+                # For other modalities (brightfield, etc.), use modality + channel
+                channel = f"{modality}_{channel_info}"
             
             # Only include FOVs that have coordinates
             if fov not in self.coordinates:
+                print(f"[NAVIGATOR WARNING] FOV {fov} not found in coordinates, skipping")
                 continue
+            
+            # Update region mapping from filename if not already set
+            if fov not in self.regions or self.regions[fov] == 'default':
+                self.regions[fov] = region
                 
             self.channels.add(channel)
-            key = (channel, region, fov)
+            key = (channel, fov)  # Simplified like grid viewer
             
             if key not in self.file_map:
                 self.file_map[key] = []
             self.file_map[key].append(filepath)
         
         self.channels = sorted(list(self.channels))
+        print(f"[NAVIGATOR] Found channels: {self.channels}")
+        print(f"[NAVIGATOR] Mapped {len(self.file_map)} channel-FOV combinations")
     
     def _build_grid(self):
-        """Build grid structure from coordinates."""
+        """Build grid structure from coordinates - matches grid viewer exactly."""
+        print("[NAVIGATOR] Building grid structure")
+        
         if not self.coordinates:
             return
-            
-        # Get coordinate bounds
-        x_coords = [c[0] for c in self.coordinates.values()]
-        y_coords = [c[1] for c in self.coordinates.values()]
         
-        x_min, x_max = min(x_coords), max(x_coords)
-        y_min, y_max = min(y_coords), max(y_coords)
-        self.grid_bounds = (x_min, x_max, y_min, y_max)
-        
-        # Get unique positions
-        x_positions = sorted(set(x_coords))
-        y_positions = sorted(set(y_coords))
+        # Get coordinate bounds and unique positions - exactly like grid viewer
+        x_positions = sorted(set(c[0] for c in self.coordinates.values()))
+        y_positions = sorted(set(c[1] for c in self.coordinates.values()))
         
         n_cols = len(x_positions)
         n_rows = len(y_positions)
-        self.grid_dims = (n_rows, n_cols)
         
-        # Create position mappings
-        tolerance = 0.001  # 1 micron
-        x_to_col = {x: i for i, x in enumerate(x_positions)}
-        y_to_row = {y: i for i, y in enumerate(y_positions)}
+        print(f"[NAVIGATOR] Grid dimensions: {n_rows} rows x {n_cols} cols")
         
-        # Build FOV grid
+        # Store bounds
+        self.grid_bounds = (min(x_positions), max(x_positions), 
+                           min(y_positions), max(y_positions))
+        
+        # Create position to index mappings with tolerance - exactly like grid viewer
+        x_to_col = {}
+        y_to_row = {}
+        
+        tolerance = 0.001  # 1 micron tolerance
+        
+        for i, x in enumerate(x_positions):
+            x_to_col[x] = i
+            
+        for i, y in enumerate(y_positions):
+            y_to_row[y] = i
+        
+        # Build FOV grid - exactly like grid viewer
         self.fov_grid.clear()
         
         for fov, (x_mm, y_mm) in self.coordinates.items():
-            # Find closest position
+            # Find closest x position
             col = None
-            row = None
-            
             for x_pos, idx in x_to_col.items():
                 if abs(x_pos - x_mm) < tolerance:
                     col = idx
                     break
                     
+            # Find closest y position
+            row = None
             for y_pos, idx in y_to_row.items():
                 if abs(y_pos - y_mm) < tolerance:
                     row = idx
                     break
                     
             if col is not None and row is not None:
-                region = self.regions.get(fov, 'default')
-                self.fov_grid[(row, col)] = (region, fov)
+                self.fov_grid[(row, col)] = fov  # Simplified like grid viewer
+            else:
+                print(f"[NAVIGATOR WARNING] Could not place FOV {fov} at ({x_mm}, {y_mm})")
+        
+        self.grid_dims = (n_rows, n_cols)
+        print(f"[NAVIGATOR] Grid built with {len(self.fov_grid)} tiles")
     
     def _calculate_pixel_to_mm_scale(self) -> Tuple[float, float]:
         """Calculate mm per pixel for the mosaic."""
@@ -215,9 +293,16 @@ class DownsampledNavigator:
         x_min, x_max, y_min, y_max = self.grid_bounds
         n_rows, n_cols = self.grid_dims
         
-        # Calculate mm per tile
-        mm_per_tile_x = (x_max - x_min) / (n_cols - 1) if n_cols > 1 else 1.0
-        mm_per_tile_y = (y_max - y_min) / (n_rows - 1) if n_rows > 1 else 1.0
+        # Calculate mm per tile - matches grid viewer logic
+        if n_cols > 1:
+            mm_per_tile_x = (x_max - x_min) / (n_cols - 1)
+        else:
+            mm_per_tile_x = 1.0  # Default value for single column
+            
+        if n_rows > 1:
+            mm_per_tile_y = (y_max - y_min) / (n_rows - 1)
+        else:
+            mm_per_tile_y = 1.0  # Default value for single row
         
         # Convert to mm per pixel
         mm_per_pixel_x = mm_per_tile_x / self.tile_size
@@ -233,119 +318,174 @@ class DownsampledNavigator:
         total_tiles = len(self.fov_grid)
         processed = 0
         
-        for (row, col), (region, fov) in self.fov_grid.items():
+        for (row, col), fov in self.fov_grid.items():
             processed += 1
-            if processed % 10 == 0:
+            if processed % 5 == 0:  # Report more frequently
                 progress = 20 + int(80 * processed / total_tiles)
                 self._report_progress(progress, f"Processing tile {processed}/{total_tiles}")
             
             # Get tile image
-            tile_img = self._get_tile_image(region, fov)
+            tile_img = self._get_tile_image(fov)
             if tile_img is None:
+                print(f"[NAVIGATOR WARNING] No tile image for FOV {fov}")
                 continue
-                
+            
             # Place in mosaic
             y_start = row * self.tile_size
             x_start = col * self.tile_size
-            mosaic[y_start:y_start + self.tile_size, 
+            
+            # Handle size mismatch
+            if tile_img.shape != (self.tile_size, self.tile_size):
+                pil_img = Image.fromarray(tile_img)
+                pil_img = pil_img.resize((self.tile_size, self.tile_size), Image.Resampling.LANCZOS)
+                tile_img = np.array(pil_img)
+            
+            mosaic[y_start:y_start + self.tile_size,
                    x_start:x_start + self.tile_size] = tile_img
         
+        print(f"[NAVIGATOR] Mosaic created: {mosaic.shape}, non-zero pixels: {np.count_nonzero(mosaic)}")
         return mosaic
     
-    def _get_tile_image(self, region: str, fov: int) -> Optional[np.ndarray]:
+    def _get_tile_image(self, fov: int) -> Optional[np.ndarray]:
         """Get or generate a tile image."""
         # Check cache first
         if self.cache_dir:
-            cache_path = self.cache_dir / f"nav_{region}_{fov}_{self.tile_size}.npy"
+            cache_path = self.cache_dir / f"nav_fov_{fov}_{self.tile_size}.npy"
             if cache_path.exists():
                 try:
-                    return np.load(cache_path)
+                    cached = np.load(cache_path)
+                    print(f"[NAVIGATOR] Loaded cached tile for FOV {fov}")
+                    return cached
                 except:
+                    print(f"[NAVIGATOR WARNING] Failed to load cache for FOV {fov}")
                     pass  # Fall through to regenerate
         
-        # Generate tile
-        tile_img = self._generate_tile(region, fov)
+        # Generate tile using the same approach as grid viewer
+        tile_img = self._generate_fov_mip(fov)
         
         # Save to cache
         if tile_img is not None and self.cache_dir:
-            cache_path = self.cache_dir / f"nav_{region}_{fov}_{self.tile_size}.npy"
-            np.save(cache_path, tile_img)
-            
+            cache_path = self.cache_dir / f"nav_fov_{fov}_{self.tile_size}.npy"
+            try:
+                np.save(cache_path, tile_img)
+                print(f"[NAVIGATOR] Cached tile for FOV {fov}")
+            except Exception as e:
+                print(f"[NAVIGATOR WARNING] Failed to cache tile for FOV {fov}: {e}")
+        
         return tile_img
     
-    def _generate_tile(self, region: str, fov: int) -> Optional[np.ndarray]:
-        """Generate a tile using the brightest channel approach."""
+    def _get_middle_z_file(self, files: List[Path]) -> Path:
+        """Select middle z-layer from list of files - exactly like grid viewer."""
+        if len(files) == 1:
+            return files[0]
+        
+        # Sort files by z-index
+        z_files = []
+        for f in files:
+            match = FPATTERN.search(f.name)
+            if match:
+                z = int(match.group("z"))
+                z_files.append((z, f))
+        
+        if not z_files:
+            return files[0]  # Fallback
+            
+        z_files.sort(key=lambda x: x[0])
+        mid_idx = len(z_files) // 2
+        
+        selected_file = z_files[mid_idx][1]
+        
+        return selected_file
+    
+    def _generate_fov_mip(self, fov: int) -> Optional[np.ndarray]:
+        """Generate fast composite image - matches grid viewer approach exactly."""
+        best_channel = None
         best_mean = -1
         best_image = None
         
-        # Quick scan for brightest channel
+        print(f"[NAVIGATOR] Generating MIP for FOV {fov}, channels: {self.channels}")
+        
+        # Quick scan: find channel with highest mean intensity - exactly like grid viewer
         for channel in self.channels:
-            key = (channel, region, fov)
+            key = (channel, fov)
             if key not in self.file_map:
+                print(f"[NAVIGATOR] No files for channel {channel}, FOV {fov}")
                 continue
                 
             # Get middle z file
-            files = self.file_map[key]
-            if not files:
-                continue
-                
-            # Sort by z and get middle
-            z_files = []
-            for f in files:
-                match = FPATTERN.match(f.name)
-                if match:
-                    z = int(match.group(3))
-                    z_files.append((z, f))
-            
-            if not z_files:
-                continue
-                
-            z_files.sort()
-            mid_file = z_files[len(z_files) // 2][1]
+            file_path = self._get_middle_z_file(self.file_map[key])
+            print(f"[NAVIGATOR] Testing channel {channel}, file: {file_path.name}")
             
             try:
-                # Quick sample for mean
-                img = tf.imread(mid_file, aszarr=True)
-                mean_val = np.mean(img[::20, ::20])
+                # Read image for mean calculation (small sample) - exactly like grid viewer
+                img_array = tf.imread(file_path)
                 
-                if mean_val > best_mean:
-                    best_mean = mean_val
-                    best_image = tf.imread(mid_file)
-            except:
+                # Quick downsample for mean calculation (every 10th pixel)
+                downsampled = img_array[::10, ::10]
+                mean_intensity = np.mean(downsampled)
+                
+                print(f"[NAVIGATOR] Channel {channel}: mean intensity = {mean_intensity}")
+                
+                if mean_intensity > best_mean:
+                    best_mean = mean_intensity
+                    best_channel = channel
+                    # Store the best image
+                    best_image = img_array
+                
+            except Exception as e:
+                print(f"[NAVIGATOR ERROR] Failed to load {channel} for FOV {fov}: {e}")
                 continue
         
         if best_image is None:
+            print(f"[NAVIGATOR WARNING] No channel data for FOV {fov}")
             return None
-            
-        # Convert to 8-bit
-        if best_image.dtype == np.uint16:
-            # Use a more aggressive conversion for brighter images
-            img_8bit = (best_image >> 6).astype(np.uint8)  # Shift less to keep more brightness
-            # Apply additional brightness boost
-            img_8bit = np.clip(img_8bit * 1.5, 0, 255).astype(np.uint8)
-        else:
-            img_min, img_max = best_image.min(), best_image.max()
-            if img_max > img_min:
-                # Normalize and apply brightness boost
-                normalized = (best_image - img_min) / (img_max - img_min)
-                # Apply gamma correction for brighter appearance
-                gamma_corrected = np.power(normalized, 0.7)  # Gamma < 1 for brighter
-                img_8bit = (gamma_corrected * 255).astype(np.uint8)
+        
+        print(f"[NAVIGATOR] Best channel for FOV {fov}: {best_channel} (mean: {best_mean})")
+        
+        try:
+            # Fast conversion to 8-bit - exactly like grid viewer but with brightness boost
+            if best_image.dtype == np.uint16:
+                # Use less aggressive bit shift to preserve more signal
+                img_8bit = (best_image >> 6).astype(np.uint8)  # Shift by 6 instead of 8
+                # Apply additional brightness boost
+                img_8bit = np.clip(img_8bit * 1.5, 0, 255).astype(np.uint8)
+            elif best_image.dtype != np.uint8:
+                # Quick normalize for other types with gamma correction
+                img_min, img_max = best_image.min(), best_image.max()
+                if img_max > img_min:
+                    normalized = (best_image - img_min) / (img_max - img_min)
+                    # Apply gamma correction for brighter appearance
+                    gamma_corrected = np.power(normalized, 0.7)  # Gamma < 1 for brighter
+                    img_8bit = (gamma_corrected * 255).astype(np.uint8)
+                else:
+                    img_8bit = np.zeros_like(best_image, dtype=np.uint8)
             else:
-                img_8bit = np.zeros_like(best_image, dtype=np.uint8)
-        
-        # Create thumbnail
-        pil_img = Image.fromarray(img_8bit)
-        pil_img.thumbnail((self.tile_size, self.tile_size), Image.Resampling.NEAREST)
-        
-        return np.array(pil_img)
+                # Already 8-bit, apply brightness boost
+                img_8bit = np.clip(best_image.astype(np.float32) * 1.5, 0, 255).astype(np.uint8)
+            
+            # Create PIL image and thumbnail - exactly like grid viewer
+            pil_img = Image.fromarray(img_8bit)
+            
+            # Fast thumbnail with NEAREST for speed
+            pil_img.thumbnail((self.tile_size, self.tile_size), 
+                            Image.Resampling.NEAREST)
+            
+            result = np.array(pil_img)
+            print(f"[NAVIGATOR] Generated tile for FOV {fov}: shape {result.shape}, range {result.min()}-{result.max()}")
+            return result
+            
+        except Exception as e:
+            print(f"[NAVIGATOR ERROR] Failed to generate composite for FOV {fov}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
     
     def pixel_to_mm(self, pixel_x: int, pixel_y: int) -> Tuple[float, float]:
         """Convert mosaic pixel coordinates to mm coordinates."""
         if not self.grid_bounds:
             return (0.0, 0.0)
             
-        x_min, _, y_min, _ = self.grid_bounds
+        x_min, x_max, y_min, y_max = self.grid_bounds
         mm_per_pixel_x, mm_per_pixel_y = self._calculate_pixel_to_mm_scale()
         
         x_mm = x_min + pixel_x * mm_per_pixel_x
@@ -358,10 +498,46 @@ class DownsampledNavigator:
         if not self.grid_bounds:
             return (0, 0)
             
-        x_min, _, y_min, _ = self.grid_bounds
+        x_min, x_max, y_min, y_max = self.grid_bounds
         mm_per_pixel_x, mm_per_pixel_y = self._calculate_pixel_to_mm_scale()
         
         pixel_x = int((x_mm - x_min) / mm_per_pixel_x)
         pixel_y = int((y_mm - y_min) / mm_per_pixel_y)
         
         return (pixel_x, pixel_y)
+
+# Convenience function for easy use
+def create_navigation_mosaic(acquisition_dir: Path, timepoint: int = 0, 
+                           tile_size: int = 75, cache_enabled: bool = True,
+                           progress_callback: Optional[Callable] = None) -> Tuple[np.ndarray, Dict]:
+    """
+    Create a navigation mosaic from an acquisition directory.
+    
+    Parameters:
+    -----------
+    acquisition_dir : Path
+        Path to the acquisition directory
+    timepoint : int
+        Timepoint to process (default: 0, uses first available)
+    tile_size : int
+        Size of each tile in pixels (default: 75)
+    cache_enabled : bool
+        Whether to use caching (default: True)
+    progress_callback : Callable
+        Optional progress callback function
+    
+    Returns:
+    --------
+    mosaic : np.ndarray
+        The navigation mosaic as a numpy array
+    metadata : dict
+        Metadata including coordinate mappings and grid info
+    """
+    navigator = DownsampledNavigator(
+        acquisition_dir=acquisition_dir,
+        tile_size=tile_size,
+        cache_enabled=cache_enabled,
+        progress_callback=progress_callback
+    )
+    
+    return navigator.create_mosaic(timepoint=timepoint)

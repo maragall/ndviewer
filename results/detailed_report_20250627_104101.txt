@@ -1,0 +1,137 @@
+DOWNSAMPLER PERFORMANCE COMPARISON REPORT
+======================================================================
+Generated: 2025-06-27T10:40:31.753754
+Acquisition Directory: /Users/julioamaragall/Documents/10x_mouse_brain_2025-04-23_00-53-11.236590
+======================================================================
+
+OVERALL SUMMARY
+--------------------------------------------------
+Total tests run: 6
+Successful comparisons: 6
+Average speedup: 22.21x
+Average improvement: 89.8%
+
+Best speedup: 54.21x (Tile size: 75, Cache: True)
+Worst speedup: 4.24x (Tile size: 50, Cache: True)
+
+DETAILED TEST RESULTS
+======================================================================
+
+Test 1: Tile size=50, Cache=True
+--------------------------------------------------
+Original implementation: 4.89s
+Optimized implementation: 1.15s
+Speedup: 4.24x
+Improvement: 76.4%
+
+Stage breakdown:
+  build_grid          :  0.000s →  0.000s (1.12x)
+  create_mosaic       :  0.282s →  1.144s (0.25x)
+  initialization      :  0.000s →  0.000s (0.84x)
+  load_coordinates    :  0.000s →  0.000s (0.99x)
+  other               :  0.000s →  0.007s (0.00x)
+  scan_files          :  0.003s →  0.002s (1.27x)
+  tile_processing     :  4.601s →  0.000s (infx)
+
+Test 2: Tile size=50, Cache=False
+--------------------------------------------------
+Original implementation: 5.16s
+Optimized implementation: 0.52s
+Speedup: 9.87x
+Improvement: 89.9%
+
+Stage breakdown:
+  build_grid          :  0.000s →  0.000s (1.00x)
+  create_mosaic       :  0.294s →  0.158s (1.86x)
+  initialization      :  0.000s →  0.000s (0.85x)
+  load_coordinates    :  0.000s →  0.001s (0.41x)
+  other               :  0.000s →  0.362s (0.00x)
+  scan_files          :  0.001s →  0.002s (0.34x)
+  tile_processing     :  4.867s →  0.000s (infx)
+
+Test 3: Tile size=75, Cache=True
+--------------------------------------------------
+Original implementation: 4.28s
+Optimized implementation: 0.08s
+Speedup: 54.21x
+Improvement: 98.2%
+
+Stage breakdown:
+  build_grid          :  0.000s →  0.000s (1.03x)
+  create_mosaic       :  0.269s →  0.074s (3.64x)
+  initialization      :  0.000s →  0.000s (1.10x)
+  load_coordinates    :  0.000s →  0.000s (1.04x)
+  other               :  0.000s →  0.003s (0.00x)
+  scan_files          :  0.001s →  0.002s (0.54x)
+  tile_processing     :  4.009s →  0.000s (infx)
+
+Test 4: Tile size=75, Cache=False
+--------------------------------------------------
+Original implementation: 3.93s
+Optimized implementation: 0.45s
+Speedup: 8.66x
+Improvement: 88.5%
+
+Stage breakdown:
+  build_grid          :  0.000s →  0.000s (1.12x)
+  create_mosaic       :  0.221s →  0.169s (1.31x)
+  initialization      :  0.000s →  0.000s (0.83x)
+  load_coordinates    :  0.000s →  0.000s (0.83x)
+  other               :  0.000s →  0.283s (0.00x)
+  scan_files          :  0.001s →  0.002s (0.38x)
+  tile_processing     :  3.712s →  0.000s (infx)
+
+Test 5: Tile size=100, Cache=True
+--------------------------------------------------
+Original implementation: 3.97s
+Optimized implementation: 0.08s
+Speedup: 47.88x
+Improvement: 97.9%
+
+Stage breakdown:
+  build_grid          :  0.000s →  0.000s (1.14x)
+  create_mosaic       :  0.226s →  0.078s (2.90x)
+  initialization      :  0.000s →  0.000s (1.25x)
+  load_coordinates    :  0.000s →  0.000s (1.05x)
+  other               :  0.000s →  0.003s (0.00x)
+  scan_files          :  0.001s →  0.002s (0.45x)
+  tile_processing     :  3.744s →  0.000s (infx)
+
+Test 6: Tile size=100, Cache=False
+--------------------------------------------------
+Original implementation: 3.96s
+Optimized implementation: 0.47s
+Speedup: 8.38x
+Improvement: 88.1%
+
+Stage breakdown:
+  build_grid          :  0.000s →  0.000s (1.16x)
+  create_mosaic       :  0.222s →  0.184s (1.20x)
+  initialization      :  0.000s →  0.000s (1.05x)
+  load_coordinates    :  0.000s →  0.000s (0.95x)
+  other               :  0.000s →  0.286s (0.00x)
+  scan_files          :  0.001s →  0.002s (0.35x)
+  tile_processing     :  3.734s →  0.000s (infx)
+
+OPTIMIZATION TECHNIQUES APPLIED
+======================================================================
+1. Parallel Processing:
+   - Parallel file scanning with ThreadPoolExecutor
+   - Parallel tile processing in batches
+   - Concurrent channel intensity pre-scanning
+
+2. I/O Optimizations:
+   - Memory-mapped file access for large images
+   - Batch CSV reading
+   - Reduced file system calls
+
+3. Algorithm Improvements:
+   - Fast area averaging for large downsampling factors
+   - Optimized 8-bit conversion with vectorized operations
+   - Smart caching of channel intensities
+
+4. Memory Efficiency:
+   - Process tiles in batches to manage memory
+   - Use memory mapping instead of loading full images
+   - Efficient numpy operations
+

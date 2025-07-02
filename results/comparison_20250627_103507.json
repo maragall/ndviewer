@@ -1,0 +1,288 @@
+{
+  "acquisition_dir": "/Users/julioamaragall/Documents/A1-A3_2025-06-18_18-13-37.157381",
+  "timestamp": "2025-06-27T10:31:20.360746",
+  "tests": [
+    {
+      "configuration": {
+        "tile_size": 50,
+        "cache_enabled": true
+      },
+      "original": {
+        "implementation": "Original",
+        "success": true,
+        "total_time": 25.703412542003207,
+        "stages": {
+          "initialization": 5.583302117884159e-05,
+          "load_coordinates": 0.0011841660598292947,
+          "scan_files": 0.018582041026093066,
+          "build_grid": 0.0001847500680014491,
+          "create_mosaic": 0.4898954581003636,
+          "tile_processing": 25.193497249973007,
+          "other": 3.708992153406143e-06
+        },
+        "error": null,
+        "mosaic_shape": [
+          750,
+          750
+        ],
+        "num_fovs": 225
+      },
+      "optimized": {
+        "implementation": "Optimized",
+        "success": true,
+        "total_time": 9.506615375052206,
+        "stages": {
+          "initialization": 8.05840827524662e-05,
+          "load_coordinates": 0.0012987080262973905,
+          "scan_files": 0.016170958057045937,
+          "build_grid": 0.00016012508422136307,
+          "create_mosaic": 9.480160915991291,
+          "other": 0.008739665965549648
+        },
+        "error": null,
+        "mosaic_shape": [
+          750,
+          750
+        ],
+        "num_fovs": 225
+      },
+      "speedup": 2.703739609520287,
+      "improvement_percentage": 63.01418981033362
+    },
+    {
+      "configuration": {
+        "tile_size": 50,
+        "cache_enabled": false
+      },
+      "original": {
+        "implementation": "Original",
+        "success": true,
+        "total_time": 25.847250082995743,
+        "stages": {
+          "initialization": 6.633298471570015e-05,
+          "load_coordinates": 0.0010581250535324216,
+          "scan_files": 0.0061963750049471855,
+          "build_grid": 0.0001551249297335744,
+          "create_mosaic": 0.5188794999849051,
+          "tile_processing": 25.32088329200633,
+          "other": 4.624947905540466e-06
+        },
+        "error": null,
+        "mosaic_shape": [
+          750,
+          750
+        ],
+        "num_fovs": 225
+      },
+      "optimized": {
+        "implementation": "Optimized",
+        "success": true,
+        "total_time": 13.808427166892216,
+        "stages": {
+          "initialization": 8.054194040596485e-05,
+          "load_coordinates": 0.0011889589950442314,
+          "scan_files": 0.027229833998717368,
+          "build_grid": 0.00016229203902184963,
+          "create_mosaic": 11.688953333068639,
+          "other": 2.0908028749981895
+        },
+        "error": null,
+        "mosaic_shape": [
+          750,
+          750
+        ],
+        "num_fovs": 225
+      },
+      "speedup": 1.8718460669415282,
+      "improvement_percentage": 46.57680363461012
+    },
+    {
+      "configuration": {
+        "tile_size": 75,
+        "cache_enabled": true
+      },
+      "original": {
+        "implementation": "Original",
+        "success": true,
+        "total_time": 25.89735529210884,
+        "stages": {
+          "initialization": 9.179208427667618e-05,
+          "load_coordinates": 0.0011182089801877737,
+          "scan_files": 0.006201999960467219,
+          "build_grid": 0.0001586669823154807,
+          "create_mosaic": 0.5117472501005977,
+          "tile_processing": 25.37802758300677,
+          "other": 4.207948222756386e-06
+        },
+        "error": null,
+        "mosaic_shape": [
+          1125,
+          1125
+        ],
+        "num_fovs": 225
+      },
+      "optimized": {
+        "implementation": "Optimized",
+        "success": true,
+        "total_time": 8.937737209023908,
+        "stages": {
+          "initialization": 5.870894528925419e-05,
+          "load_coordinates": 0.0012283750111237168,
+          "scan_files": 0.01611604099161923,
+          "build_grid": 0.00016479205805808306,
+          "create_mosaic": 8.911402125027962,
+          "other": 0.008762374985963106
+        },
+        "error": null,
+        "mosaic_shape": [
+          1125,
+          1125
+        ],
+        "num_fovs": 225
+      },
+      "speedup": 2.8975292835821804,
+      "improvement_percentage": 65.48783801198681
+    },
+    {
+      "configuration": {
+        "tile_size": 75,
+        "cache_enabled": false
+      },
+      "original": {
+        "implementation": "Original",
+        "success": true,
+        "total_time": 26.137570332968608,
+        "stages": {
+          "initialization": 7.158296648412943e-05,
+          "load_coordinates": 0.0010606669820845127,
+          "scan_files": 0.01330195798072964,
+          "build_grid": 0.0001832079142332077,
+          "create_mosaic": 0.5686107079964131,
+          "tile_processing": 25.55432999995537,
+          "other": 5.917041562497616e-06
+        },
+        "error": null,
+        "mosaic_shape": [
+          1125,
+          1125
+        ],
+        "num_fovs": 225
+      },
+      "optimized": {
+        "implementation": "Optimized",
+        "success": true,
+        "total_time": 14.782418707967736,
+        "stages": {
+          "initialization": 7.650000043213367e-05,
+          "load_coordinates": 0.0013128329301252961,
+          "scan_files": 0.01625216705724597,
+          "build_grid": 0.00016533397138118744,
+          "create_mosaic": 12.181876540998928,
+          "other": 2.582728000008501
+        },
+        "error": null,
+        "mosaic_shape": [
+          1125,
+          1125
+        ],
+        "num_fovs": 225
+      },
+      "speedup": 1.7681524823052426,
+      "improvement_percentage": 43.44379175396445
+    },
+    {
+      "configuration": {
+        "tile_size": 100,
+        "cache_enabled": true
+      },
+      "original": {
+        "implementation": "Original",
+        "success": true,
+        "total_time": 26.230677250074223,
+        "stages": {
+          "initialization": 0.00012341700494289398,
+          "load_coordinates": 0.001099291956052184,
+          "scan_files": 0.006432583089917898,
+          "build_grid": 0.00016016594599932432,
+          "create_mosaic": 0.5186092080548406,
+          "tile_processing": 25.704243000014685,
+          "other": 4.00003045797348e-06
+        },
+        "error": null,
+        "mosaic_shape": [
+          1500,
+          1500
+        ],
+        "num_fovs": 225
+      },
+      "optimized": {
+        "implementation": "Optimized",
+        "success": true,
+        "total_time": 9.365078583941795,
+        "stages": {
+          "initialization": 6.754195783287287e-05,
+          "load_coordinates": 0.0012720840750262141,
+          "scan_files": 0.027990041999146342,
+          "build_grid": 0.00016579101793467999,
+          "create_mosaic": 9.326094084070064,
+          "other": 0.00948187499307096
+        },
+        "error": null,
+        "mosaic_shape": [
+          1500,
+          1500
+        ],
+        "num_fovs": 225
+      },
+      "speedup": 2.800903058630143,
+      "improvement_percentage": 64.29722917689709
+    },
+    {
+      "configuration": {
+        "tile_size": 100,
+        "cache_enabled": false
+      },
+      "original": {
+        "implementation": "Original",
+        "success": true,
+        "total_time": 26.625899499980733,
+        "stages": {
+          "initialization": 0.00011508306488394737,
+          "load_coordinates": 0.0011903339764103293,
+          "scan_files": 0.006832959013991058,
+          "build_grid": 0.00015758303925395012,
+          "create_mosaic": 0.5045439579989761,
+          "tile_processing": 26.11304874997586,
+          "other": 4.249974153935909e-06
+        },
+        "error": null,
+        "mosaic_shape": [
+          1500,
+          1500
+        ],
+        "num_fovs": 225
+      },
+      "optimized": {
+        "implementation": "Optimized",
+        "success": true,
+        "total_time": 13.8887524579186,
+        "stages": {
+          "initialization": 6.716593634337187e-05,
+          "load_coordinates": 0.001160791958682239,
+          "scan_files": 0.016488083987496793,
+          "build_grid": 0.00016175000928342342,
+          "create_mosaic": 11.695809541968629,
+          "other": 2.1750544159440324
+        },
+        "error": null,
+        "mosaic_shape": [
+          1500,
+          1500
+        ],
+        "num_fovs": 225
+      },
+      "speedup": 1.9170835955680179,
+      "improvement_percentage": 47.83743378161309
+    }
+  ]
+}

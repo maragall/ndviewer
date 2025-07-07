@@ -140,7 +140,7 @@ class LayerManager:
             edge_color='red',
             face_color='transparent',
             edge_width=self.config.box_edge_width,
-            name=f'_Navigator Box {region_name}',
+            name=f'_Navigator Box {region_name} <hidden>',
             opacity=1.0
         )
         

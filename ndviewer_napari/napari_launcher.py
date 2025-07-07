@@ -11,17 +11,17 @@ import sys
 import subprocess
 import tempfile
 import pickle
-from PyQt6.QtWidgets import QApplication, QFileDialog, QDialog, QVBoxLayout, QPushButton, QLabel
+from PyQt6.QtWidgets import QApplication, QFileDialog, QDialog, QVBoxLayout, QPushButton, QLabel, QCheckBox
 from PyQt6.QtCore import QObject, pyqtSignal, QThread, Qt
 
-# Import the downsampler module from parent directory
+# Import the downsampler module from utils directory
 try:
     import sys
     import os
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from downsampler import DownsampledNavigator
+    from utils.downsampler import DownsampledNavigator
     NAVIGATOR_AVAILABLE = True
-    print("Successfully imported downsampler module")
+    print("Successfully imported downsampler module from utils")
 except ImportError as e:
     print(f"Warning: downsampler module not found: {e}")
     NAVIGATOR_AVAILABLE = False
@@ -339,7 +339,7 @@ class DirectorySelector(QDialog):
         
     def initUI(self):
         self.setWindowTitle('Select Acquisition Directory')
-        self.setGeometry(300, 300, 400, 150)
+        self.setGeometry(300, 300, 400, 180)
         
         layout = QVBoxLayout()
         
@@ -354,6 +354,12 @@ class DirectorySelector(QDialog):
             }
         """)
         layout.addWidget(self.label)
+        
+        # Add navigator checkbox
+        self.navigator_checkbox = QCheckBox('Enable Navigator')
+        self.navigator_checkbox.setChecked(NAVIGATOR_AVAILABLE)  # Default to checked if navigator is available
+        self.navigator_checkbox.setEnabled(NAVIGATOR_AVAILABLE)  # Disable if navigator not available
+        layout.addWidget(self.navigator_checkbox)
         
         self.setLayout(layout)
         
@@ -384,12 +390,14 @@ class DirectorySelector(QDialog):
         # Get the path to the viewer script
         viewer_script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'napari_viewer_script.py')
         
-        # Launch the viewer script in a separate process
-        subprocess.Popen([sys.executable, viewer_script_path, temp_file])
+        # Get navigator preference from checkbox
+        enable_navigator = self.navigator_checkbox.isChecked()
+        
+        # Launch the viewer script in a separate process with navigator preference
+        subprocess.Popen([sys.executable, viewer_script_path, temp_file, '--navigator' if enable_navigator else '--no-navigator'])
     
     def handle_error(self, error_msg, folder_name):
         self.label.setText(f'Error loading {folder_name}: {error_msg}')
-
 
 if __name__ == "__main__":
     # Create PyQt application

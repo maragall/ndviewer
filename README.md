@@ -8,4 +8,5 @@ chmod +x setup.sh
 ```
 ## Create Desktop Shortcut
 ```
+cd utils
 python create_desktop_shortcut.py

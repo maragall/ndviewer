@@ -14,8 +14,8 @@ from datetime import datetime
 import traceback
 import sys
 
-# Import the downsampler module
-from downsampler import DownsampledNavigator
+# Import the downsampler module from utils
+from utils.downsampler import DownsampledNavigator
 
 class PerformanceProfiler:
     """Profile and analyze the performance of the downsampler."""

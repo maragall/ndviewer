@@ -12,9 +12,9 @@ from typing import Dict, Tuple
 import json
 from datetime import datetime
 
-# Import both implementations
-from downsampler import DownsampledNavigator
-from downsampler_optimized import OptimizedDownsampledNavigator
+# Import both implementations from utils
+from utils.downsampler import DownsampledNavigator
+from utils.downsampler_optimized import OptimizedDownsampledNavigator
 
 
 class PerformanceComparison:

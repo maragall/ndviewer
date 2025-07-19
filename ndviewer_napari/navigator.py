@@ -762,9 +762,35 @@ class NavigatorOverlay:
         try:
             self.state.updating_navigator = True
             self._update_navigator_visibility()
-            self._update_navigator_box(force_update=True)  # Force update on dimension change
+            self._update_navigator_box(force_update=True)
+            
+            # NEW: Auto-sync contrast when region changes
+            self._auto_sync_contrast_on_region_change()
+            
         finally:
             self.state.updating_navigator = False
+
+    def _auto_sync_contrast_on_region_change(self):
+        """Automatically sync FOV contrast with the current region's navigator"""
+        current_region = self._get_current_region()
+        
+        # Find visible FOV layers
+        for layer in self.viewer.layers:
+            if ('Channel:' in layer.name and 
+                hasattr(layer, 'metadata') and
+                layer.metadata.get('channel_index') is not None and
+                layer.visible):
+                
+                channel_idx = layer.metadata.get('channel_index')
+                channel_name = self.channel_names[channel_idx]
+                
+                # Find the corresponding navigator layer for this region and channel
+                nav_layer = self.nav_channel_layers.get((current_region, channel_idx))
+                
+                if nav_layer and nav_layer.visible:
+                    # Sync navigator contrast to FOV
+                    self.contrast_sync.sync_navigator_to_fov(nav_layer, layer, channel_name)
+                    print(f"Auto-synced contrast for {channel_name} on region change")
     
     def _on_layer_selection_changed(self, event):
         """Handle layer selection changes"""
@@ -880,6 +906,12 @@ class NavigatorOverlay:
             def on_nav_contrast_change(event, r_idx=region_idx, n_layer=nav_layer):
                 if self.state.updating_contrast or not n_layer.visible:
                     return
+                
+                # Only sync if this navigator belongs to the current region
+                current_region = self._get_current_region()
+                if r_idx != current_region:
+                    return
+                    
                 self.contrast_sync.sync_navigator_to_fov(n_layer, fov_layer, channel_name)
     
     def _setup_visibility_sync(self):

@@ -84,30 +84,33 @@ class FileHandler:
         if config.cache_enabled:
             self.cache_dir = self.acquisition_dir / "tile_cache"
             self.cache_dir.mkdir(exist_ok=True)
-            self._clear_cache()
+            # Don't clear cache on initialization - let it persist for performance
+            # Cache will be used if available, regenerated if not
     
     def _clear_cache(self):
         """Clear all cache files to ensure contrast changes take effect"""
         if not self.cache_dir or not self.cache_dir.exists():
             return
         
-        cache_patterns = [
-            f"nav_*_{self.config.tile_size}.npy",
-            f"nav_*_fov_*_{self.config.tile_size}.npy",
-            f"nav_*_fov_*_ch_*_{self.config.tile_size}.npy"
-        ]
+        # Use the exact cache file pattern that matches what we save
+        cache_pattern = f"nav_*_fov_*_ch_*_{self.config.tile_size}.npy"
         
-        cache_files = []
-        for pattern in cache_patterns:
-            cache_files.extend(self.cache_dir.glob(pattern))
+        cache_files = list(self.cache_dir.glob(cache_pattern))
         
         if cache_files:
             print(f"[NAVIGATOR] Clearing {len(cache_files)} cached tiles...")
+            deleted_count = 0
             for file in cache_files:
                 try:
-                    file.unlink()
+                    if file.exists():  # Only delete if file still exists
+                        file.unlink()
+                        deleted_count += 1
                 except Exception as e:
                     print(f"[NAVIGATOR WARNING] Failed to delete {file.name}: {e}")
+            
+            print(f"[NAVIGATOR] Successfully deleted {deleted_count} cached tiles")
+        else:
+            print(f"[NAVIGATOR] No cached tiles found to clear")
     
     def find_timepoint_dir(self, timepoint: int = 0) -> Path:
         """Find the appropriate timepoint directory"""
@@ -248,13 +251,17 @@ class FileHandler:
         
         if cache_path.exists():
             try:
-                return np.load(cache_path)
+                cached_tile = np.load(cache_path)
+                print(f"[NAVIGATOR] Loaded cached tile: {cache_path.name}")
+                return cached_tile
             except Exception as e:
                 print(f"[NAVIGATOR WARNING] Failed to load cache: {e}")
                 try:
                     cache_path.unlink()
                 except:
                     pass
+        else:
+            print(f"[NAVIGATOR] No cached tile: {cache_path.name}")
         
         return None
     
@@ -267,6 +274,7 @@ class FileHandler:
         
         try:
             np.save(cache_path, tile)
+            print(f"[NAVIGATOR] Saved tile: {cache_path.name}")
         except Exception as e:
             print(f"[NAVIGATOR WARNING] Failed to cache tile: {e}")
     

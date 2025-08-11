@@ -1,22 +1,12 @@
 #!/bin/bash
-
-# Exit on any error
 set -e
 
-# Get the conda base directory
-CONDA_BASE=$(conda info --base)
+echo "Installing system packages..."
+sudo apt update
+sudo apt install -y mesa-utils libgl1-mesa-glx libgl1-mesa-dri python3-pip
 
-# Source conda initialization
-source "$CONDA_BASE/etc/profile.d/conda.sh"
+echo "Installing Python packages with system pip..."
+pip3 install --user vispy PyQt6 tifffile zarr pandas numpy numcodecs dask napari
 
-echo "Creating conda environment 'ndv' with Python 3.12..."
-conda create -n ndv python=3.12 -y
-
-echo "Activating conda environment 'ndv'..."
-conda activate ndv
-
-echo "Installing Python packages..."
-pip install --no-cache-dir vispy PyQt6 tifffile zarr pandas numpy numcodecs==0.15.1 dask napari
-
-echo "Setup complete! Environment 'ndv' is ready to use."
-echo "To activate the environment in the future, run: conda activate ndv"
+echo "Setup complete! Use system Python:"
+echo "  python3 napari_launcher.py"

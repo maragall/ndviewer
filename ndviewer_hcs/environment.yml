@@ -1,0 +1,24 @@
+name: ndv_HCS
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.13.2
+  - pip
+  - numpy
+  - pandas
+  - matplotlib
+  - scikit-image
+  - pillow
+  - pip:
+      - basicpy==1.0.0
+      - tifffile
+      - zarr
+      - xarray
+      - dask
+      - pyqt5
+      - ndv==0.4.0
+      - qtpy==2.4.3
+      - superqt==0.7.3
+      - pyconify==0.2.1
+      - vispy==0.14.3

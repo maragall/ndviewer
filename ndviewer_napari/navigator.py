@@ -71,6 +71,9 @@ class LayerManager:
         if self.scaling_manager:
             navigator_scale = self.scaling_manager.get_navigator_scale()
         
+        # Calculate FOV-style contrast limits for Navigator layer
+        nav_contrast_limits = self._get_fov_layer_contrast_limits(channel_idx, mosaic_array)
+        
         layer = self.viewer.add_image(
             mosaic_array,
             name=f'_{region_name} - Fluorescence_{self._extract_wavelength(channel_name)}_nm_EX',
@@ -87,7 +90,7 @@ class LayerManager:
                 'channel_name': channel_name,
                 'navigator_channel_idx': nav_channel_idx
             },
-            contrast_limits=[mosaic_array.min(), mosaic_array.max()]
+            contrast_limits=nav_contrast_limits
         )
         
         # Set interactive property after creation
@@ -159,6 +162,67 @@ class LayerManager:
         match = re.search(r'(\d{3})', channel_name)
         return match.group(1) if match else "000"
     
+    def _get_fov_layer_contrast_limits(self, channel_idx: int, mosaic_array: np.ndarray) -> List[float]:
+        """Get contrast limits from existing FOV layer or calculate FOV-style limits"""
+        try:
+            # First, try to get contrast limits from existing FOV layer for same channel
+            for layer in self.viewer.layers:
+                if ('Channel:' in layer.name and 
+                    hasattr(layer, 'metadata') and 
+                    layer.metadata.get('channel_index') == channel_idx):
+                    
+                    fov_contrast = layer.contrast_limits
+                    print(f"[NAVIGATOR] Using FOV layer contrast limits for channel {channel_idx}: {fov_contrast}")
+                    return list(fov_contrast)
+            
+            # If no FOV layer found, calculate FOV-style contrast limits
+            print(f"[NAVIGATOR] No FOV layer found for channel {channel_idx}, calculating FOV-style limits")
+            return self._calculate_fov_style_contrast_limits(mosaic_array)
+            
+        except Exception as e:
+            print(f"[NAVIGATOR ERROR] Failed to get FOV layer contrast limits: {e}")
+            return self._calculate_fov_style_contrast_limits(mosaic_array)
+    
+    def _calculate_fov_style_contrast_limits(self, data: np.ndarray) -> List[float]:
+        """Calculate contrast limits using the same method as napari's auto-calculation for FOV layers"""
+        try:
+            # Mimic napari's auto-contrast calculation
+            # Napari typically uses 2nd and 98th percentiles for auto-contrast
+            
+            # For large arrays, sample to speed up calculation
+            if data.size > 1000000:  # Sample if > 1M pixels
+                # Take every 10th pixel in each dimension
+                sample = data[::10, ::10]
+            else:
+                sample = data
+            
+            # Remove zeros and very low values that might be background
+            non_zero_data = sample[sample > 0]
+            if len(non_zero_data) == 0:
+                # Fallback to full data if no non-zero values
+                non_zero_data = sample
+            
+            # Calculate percentiles like napari does
+            # Use 2nd and 98th percentiles to avoid outliers
+            p2, p98 = np.percentile(non_zero_data, [2, 98])
+            
+            # Ensure valid range
+            if p98 <= p2:
+                p2 = float(sample.min())
+                p98 = float(sample.max())
+                # If still equal, add small offset
+                if p98 <= p2:
+                    p98 = p2 + 1.0
+            
+            contrast_limits = [float(p2), float(p98)]
+            print(f"[NAVIGATOR] Calculated FOV-style contrast limits: {contrast_limits}")
+            return contrast_limits
+            
+        except Exception as e:
+            print(f"[NAVIGATOR ERROR] Failed to calculate FOV-style contrast limits: {e}")
+            # Fallback to data range
+            return [float(data.min()), float(data.max())]
+    
     def remove_navigator_boxes(self):
         """Remove all navigator box layers"""
         to_remove = [layer for layer in self.viewer.layers 
@@ -225,20 +289,12 @@ class ContrastSynchronizer:
             self.state.updating_contrast = False
     
     def _get_layer_data_range(self, layer) -> Tuple[float, float]:
-        """Get the full data range for a layer"""
+        """Get the full data range for a layer using actual data percentiles"""
         try:
             data = layer.data
             
-            # Navigator layers use theoretical bit depth range
-            if layer.name.startswith('_') and 'Channel:' not in layer.name:
-                dtype_ranges = {
-                    np.uint8: (0.0, 255.0),
-                    np.uint16: (0.0, 65535.0),
-                    np.uint32: (0.0, 4294967295.0)
-                }
-                return dtype_ranges.get(data.dtype, layer.contrast_limits)
-            
-            # FOV layers use actual data range
+            # Both Navigator and FOV layers now use actual data range
+            # This eliminates the mismatch that caused contrast amplification
             if hasattr(data, 'compute'):
                 sample = data[..., ::5, ::5] if data.ndim >= 2 else data
                 sample_computed = sample.compute()

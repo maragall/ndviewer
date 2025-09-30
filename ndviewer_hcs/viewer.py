@@ -586,8 +586,32 @@ class ViewerMainWindow(QMainWindow):
         self.setWindowTitle("Multi-Channel TIFF Viewer with Embedded NDV")
         self.setGeometry(100, 100, 1400, 800)
         
+        # Apply dark theme
+        from PyQt5.QtWidgets import QStyleFactory
+        self.setStyle(QStyleFactory.create("Fusion"))
+        self._set_dark_palette()
+        
         self.tiff_viewer = TiffViewerWidget(base_path, timepoint, downsample_factor)
         self.setCentralWidget(self.tiff_viewer)
+    
+    def _set_dark_palette(self):
+        """Set dark color palette"""
+        from PyQt5.QtGui import QPalette, QColor
+        dark_palette = self.palette()
+        dark_palette.setColor(QPalette.Window, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.WindowText, QColor(255, 255, 255))
+        dark_palette.setColor(QPalette.Base, QColor(35, 35, 35))
+        dark_palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.ToolTipBase, QColor(25, 25, 25))
+        dark_palette.setColor(QPalette.ToolTipText, QColor(255, 255, 255))
+        dark_palette.setColor(QPalette.Text, QColor(255, 255, 255))
+        dark_palette.setColor(QPalette.Button, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.ButtonText, QColor(255, 255, 255))
+        dark_palette.setColor(QPalette.BrightText, QColor(255, 0, 0))
+        dark_palette.setColor(QPalette.Link, QColor(42, 130, 218))
+        dark_palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+        dark_palette.setColor(QPalette.HighlightedText, QColor(35, 35, 35))
+        self.setPalette(dark_palette)
         
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)

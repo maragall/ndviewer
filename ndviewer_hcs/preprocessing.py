@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from skimage import io
-from basicpy import BaSiC
+# from basicpy import BaSiC
 
 from .common import TileData, ImageProcessor, COLOR_MAPS
 

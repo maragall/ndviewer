@@ -27,12 +27,12 @@ class DropBox(QFrame):
         self.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
         self.setStyleSheet("""
             DropBox {
-                background-color: #f8f8f8;
-                border: 2px dashed #999;
+                background-color: #2b2b2b;
+                border: 2px dashed #666;
                 border-radius: 5px;
             }
             DropBox:hover {
-                background-color: #e8f4f8;
+                background-color: #353535;
                 border-color: #4CAF50;
             }
         """)
@@ -49,10 +49,10 @@ class DropBox(QFrame):
         # Show folder name and change border color
         folder_name = Path(path).name
         self.label.setText(f"{folder_name}")
-        self.label.setStyleSheet("color: #2e7d32; font-weight: bold; font-size: 11px; border: none;")
+        self.label.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 11px; border: none;")
         self.setStyleSheet("""
             DropBox {
-                background-color: #e8f5e9;
+                background-color: #1e3a1e;
                 border: 2px solid #4CAF50;
                 border-radius: 5px;
             }
@@ -61,7 +61,7 @@ class DropBox(QFrame):
     def set_status(self, message):
         """Update status message in dropbox"""
         self.label.setText(message)
-        self.label.setStyleSheet("color: #666; font-size: 11px; border: none;")
+        self.label.setStyleSheet("color: #aaa; font-size: 11px; border: none;")
     
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -281,6 +281,27 @@ class ConfigurationGUI(QMainWindow):
 def main():
     """Entry point for configuration GUI"""
     app = QApplication(sys.argv)
+    
+    # Set dark style
+    from PyQt5.QtWidgets import QStyleFactory
+    app.setStyle(QStyleFactory.create("Fusion"))
+    dark_palette = app.palette()
+    from PyQt5.QtGui import QPalette, QColor
+    dark_palette.setColor(QPalette.Window, QColor(53, 53, 53))
+    dark_palette.setColor(QPalette.WindowText, QColor(255, 255, 255))
+    dark_palette.setColor(QPalette.Base, QColor(35, 35, 35))
+    dark_palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
+    dark_palette.setColor(QPalette.ToolTipBase, QColor(25, 25, 25))
+    dark_palette.setColor(QPalette.ToolTipText, QColor(255, 255, 255))
+    dark_palette.setColor(QPalette.Text, QColor(255, 255, 255))
+    dark_palette.setColor(QPalette.Button, QColor(53, 53, 53))
+    dark_palette.setColor(QPalette.ButtonText, QColor(255, 255, 255))
+    dark_palette.setColor(QPalette.BrightText, QColor(255, 0, 0))
+    dark_palette.setColor(QPalette.Link, QColor(42, 130, 218))
+    dark_palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+    dark_palette.setColor(QPalette.HighlightedText, QColor(35, 35, 35))
+    app.setPalette(dark_palette)
+    
     window = ConfigurationGUI()
     window.show()
     sys.exit(app.exec_())

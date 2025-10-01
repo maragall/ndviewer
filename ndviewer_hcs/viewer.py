@@ -57,7 +57,7 @@ class TiffViewerWidget(QWidget):
         from .preprocessing import PlateAssembler
         assembler = PlateAssembler(base_path, timepoint)
         target_px = int(assembler._get_original_pixel_size() * downsample_factor)
-        self.assembled_data, self.pixel_map = assembler.assemble_plate(target_px)
+        self.assembled_data, self.tile_map = assembler.assemble_plate(target_px)
         
         if not self.assembled_data or 'multichannel' not in self.assembled_data:
             print("No images found!")
@@ -116,26 +116,25 @@ class TiffViewerWidget(QWidget):
         self.setLayout(main_layout)
     
     def _setup_tile_grid(self):
-        """Setup tile grid information for efficient coordinate lookup"""
-        sample_tile = next(iter(self.pixel_map.values()))
-        sample_img = sample_tile.image
-        self.tile_h, self.tile_w = sample_img.shape[:2]
+        """Setup tile grid information from lightweight tile map"""
+        from types import SimpleNamespace
         
-        unique_coords = {
-            'x': sorted(set(t.x_mm for t in self.pixel_map.values())),
-            'y': sorted(set(t.y_mm for t in self.pixel_map.values()))
-        }
+        # Extract tile dimensions from tile_map
+        self.tile_h, self.tile_w = self.tile_map['tile_dimensions']
         
-        self.coord_to_grid = {
-            'x': {x: i for i, x in enumerate(unique_coords['x'])},
-            'y': {y: i for i, y in enumerate(unique_coords['y'])}
-        }
-        
+        # Convert tile metadata dicts to SimpleNamespace objects for compatibility
         self.grid_to_tile = {}
-        for tile in self.pixel_map.values():
-            grid_x = self.coord_to_grid['x'][tile.x_mm]
-            grid_y = self.coord_to_grid['y'][tile.y_mm]
-            self.grid_to_tile[(grid_x, grid_y)] = tile
+        for (grid_x, grid_y), tile_info in self.tile_map['grid_to_tile'].items():
+            tile_obj = SimpleNamespace(
+                region=tile_info['region'],
+                fov=tile_info['fov'],
+                x_mm=tile_info['x_mm'],
+                y_mm=tile_info['y_mm']
+            )
+            self.grid_to_tile[(grid_x, grid_y)] = tile_obj
+        
+        # Store FOV file index for O(1) lookup
+        self.fov_to_files = self.tile_map['fov_to_files']
 
     def _create_color_image(self) -> np.ndarray:
         channels, height, width = self.multichannel_image.shape
@@ -243,7 +242,7 @@ class TiffViewerWidget(QWidget):
     
     def _calculate_well_format(self):
         """Calculate rows and columns based on region count following standard well plate formats"""
-        regions = set(tile.region for tile in self.pixel_map.values())
+        regions = set(tile.region for tile in self.grid_to_tile.values())
         cell_count = len(regions)
         
         if cell_count <= 4: return (2, 2)
@@ -440,7 +439,7 @@ class TiffViewerWidget(QWidget):
             print(f"Error ensuring composite mode and LUTs: {e}")
 
     def create_fov_zarr_array(self, target_fov: int, target_region: str = None) -> Optional[xr.DataArray]:
-        """Create a lazy-loading xarray DataArray that maintains full dimensions"""
+        """Create a lazy-loading xarray DataArray using O(1) file lookup"""
         if not ZARR_AVAILABLE:
             print("Zarr/tifffile/xarray not available")
             return None
@@ -462,22 +461,27 @@ class TiffViewerWidget(QWidget):
             #         print(f"Error loading flatfields: {e}")
             #         flatfield_data = None
             
-            # Get all TIFF files
+            # O(1) lookup using pre-built FOV file index
             base_path = Path(self.base_path)
-            all_tiffs = list(base_path.rglob("*.tiff"))
-            if not all_tiffs:
-                return None
+            fov_key = (target_region, target_fov)
             
-            # Filter files for target FOV and region
-            fov_files = []
-            for tiff_path in all_tiffs:
-                if m := fpattern.search(tiff_path.name):
-                    fov = int(m.group("f"))
-                    region = m.group("r")
-                    if fov == target_fov and (target_region is None or region == target_region):
-                        fov_files.append(str(tiff_path))
+            if fov_key not in self.fov_to_files:
+                print(f"FOV {target_fov} in region {target_region} not found in tile map")
+                # Fallback: try scanning for files if not in index
+                all_tiffs = list(base_path.rglob("*.tiff"))
+                fov_files = []
+                for tiff_path in all_tiffs:
+                    if m := fpattern.search(tiff_path.name):
+                        fov = int(m.group("f"))
+                        region = m.group("r")
+                        if fov == target_fov and (target_region is None or region == target_region):
+                            fov_files.append(str(tiff_path))
+            else:
+                # Fast path: get files directly from index
+                fov_files = list(self.fov_to_files[fov_key].values())
             
             if not fov_files:
+                print(f"No files found for FOV {target_fov} in region {target_region}")
                 return None
             
             axes, shape, indices, sorted_files = parse_filenames(fov_files)

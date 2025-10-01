@@ -133,7 +133,7 @@ class PlateAssembler:
         
         Returns:
             assembled_images: dict with 'multichannel', 'wavelengths', 'colormaps'
-            pixel_map: dict mapping (x,y) pixels to tiles
+            tile_map: lightweight dict with tile_dimensions, grid_to_tile, fov_to_files
         """
         downsample_factor = target_pixel_size / self._get_original_pixel_size() if target_pixel_size else 0.85
         skip_downsampling = downsample_factor >= 0.98
@@ -146,15 +146,15 @@ class PlateAssembler:
         
         # Load and process tiles
         tiles = self._load_tiles(flatfields, downsample_factor, skip_downsampling)
-        assembled_images, pixel_map = self._assemble_images(tiles)
+        assembled_images, tile_map = self._assemble_images(tiles)
         
         if assembled_images:
-            self._save_to_cache(cache_key, assembled_images, pixel_map)
+            self._save_to_cache(cache_key, assembled_images, tile_map)
             
             # Save target pixel size to acquisition folder
             self._save_metadata(target_pixel_size)
         
-        return assembled_images, pixel_map
+        return assembled_images, tile_map
     
     def _get_original_pixel_size(self) -> int:
         """Get original image pixel size from first image"""
@@ -171,11 +171,11 @@ class PlateAssembler:
     
     def _cache_exists(self, cache_key: str) -> bool:
         return all((self.cache_dir / f"{cache_key}_{name}").exists()
-                  for name in ["pixel_map.pkl", "multichannel.tiff", "metadata.pkl"])
+                  for name in ["tile_map.pkl", "multichannel.tiff", "metadata.pkl"])
     
     def _load_from_cache(self, cache_key: str) -> Tuple[Dict, Dict]:
-        with open(self.cache_dir / f"{cache_key}_pixel_map.pkl", 'rb') as f:
-            pixel_map = pickle.load(f)
+        with open(self.cache_dir / f"{cache_key}_tile_map.pkl", 'rb') as f:
+            tile_map = pickle.load(f)
         multichannel_image = io.imread(self.cache_dir / f"{cache_key}_multichannel.tiff")
         
         if len(multichannel_image.shape) == 3 and multichannel_image.shape[2] <= 10:
@@ -188,12 +188,12 @@ class PlateAssembler:
             'multichannel': multichannel_image,
             'wavelengths': metadata['wavelengths'],
             'colormaps': metadata['colormaps']
-        }, pixel_map
+        }, tile_map
     
-    def _save_to_cache(self, cache_key: str, assembled_images: Dict, pixel_map: Dict):
+    def _save_to_cache(self, cache_key: str, assembled_images: Dict, tile_map: Dict):
         # Save to cache directory for fast loading
-        with open(self.cache_dir / f"{cache_key}_pixel_map.pkl", 'wb') as f:
-            pickle.dump(pixel_map, f)
+        with open(self.cache_dir / f"{cache_key}_tile_map.pkl", 'wb') as f:
+            pickle.dump(tile_map, f)
         
         multichannel_image = assembled_images['multichannel']
         if len(multichannel_image.shape) == 3 and multichannel_image.shape[0] <= 10:
@@ -267,7 +267,12 @@ class PlateAssembler:
         return tiles
     
     def _assemble_images(self, tiles: Dict) -> Tuple[Dict, Dict]:
-        """Assemble tiles into multichannel canvas"""
+        """Assemble tiles into multichannel canvas with lightweight tile mapping
+        
+        Returns:
+            assembled_images: dict with multichannel canvas, wavelengths, colormaps
+            tile_map: lightweight dict with tile_dimensions, grid_to_tile, fov_to_files
+        """
         if not tiles:
             return {}, {}
         
@@ -287,7 +292,13 @@ class PlateAssembler:
         canvas_h = len(unique_coords['y']) * tile_h
         wavelengths = sorted(set(key[2] for key in tiles.keys()))
         canvas = np.zeros((len(wavelengths), canvas_h, canvas_w), dtype=sample_img.dtype)
-        pixel_map = {}
+        
+        # Build lightweight tile map instead of per-pixel map
+        tile_map = {
+            'tile_dimensions': (tile_h, tile_w),
+            'grid_to_tile': {},      # (grid_x, grid_y) -> tile metadata dict
+            'fov_to_files': {}       # (region, fov) -> {wavelength: file_path}
+        }
         
         for channel_idx, wavelength in enumerate(wavelengths):
             for (region, fov, wl), tile in tiles.items():
@@ -298,14 +309,28 @@ class PlateAssembler:
                 y_pixel = coord_to_grid['y'][tile.y_mm] * tile_h
                 canvas[channel_idx, y_pixel:y_pixel+tile_h, x_pixel:x_pixel+tile_w] = tile.image
                 
+                # Store tile metadata once per grid position (not per pixel!)
                 if channel_idx == 0:
-                    for y in range(y_pixel, y_pixel + tile_h):
-                        for x in range(x_pixel, x_pixel + tile_w):
-                            pixel_map[(x, y)] = tile
+                    grid_x = coord_to_grid['x'][tile.x_mm]
+                    grid_y = coord_to_grid['y'][tile.y_mm]
+                    tile_map['grid_to_tile'][(grid_x, grid_y)] = {
+                        'region': tile.region,
+                        'fov': tile.fov,
+                        'x_mm': tile.x_mm,
+                        'y_mm': tile.y_mm,
+                        'x_pixel': x_pixel,
+                        'y_pixel': y_pixel
+                    }
+                
+                # Build FOV file index for O(1) lookup
+                key = (region, fov)
+                if key not in tile_map['fov_to_files']:
+                    tile_map['fov_to_files'][key] = {}
+                tile_map['fov_to_files'][key][wl] = tile.file_path
         
         return {
             'multichannel': canvas,
             'wavelengths': wavelengths,
             'colormaps': [self._get_colormap(wl) for wl in wavelengths]
-        }, pixel_map
+        }, tile_map
 

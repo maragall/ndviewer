@@ -12,7 +12,8 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QLabel, QSplitter,
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen
 from PyQt5.QtCore import Qt, pyqtSignal
 
-from .common import COLOR_WEIGHTS, WELL_FORMATS, parse_filenames, fpattern
+from .common import COLOR_WEIGHTS, parse_filenames, fpattern
+from .plate_stack import PlateStackManager, StackBuilderThread, NDVSyncController, NDVContrastSyncController
 
 # NDV and zarr imports
 try:
@@ -51,7 +52,15 @@ class TiffViewerWidget(QWidget):
         self.base_path = base_path
         self.timepoint = timepoint
         self.downsample_factor = downsample_factor
-        self.cache_dir = Path(base_path) / "assembled_tiles_cache"
+        # Use consistent cache directory - in downsampled_image folder
+        self.cache_dir = Path(base_path) / "downsampled_image" / "assembled_tiles_cache"
+        
+        # Initialize plate stack manager
+        self.plate_stack = PlateStackManager(base_path, self.cache_dir)
+        self.ndv_sync = None  # Will be initialized after NDV viewer is created
+        self.ndv_contrast_sync = None  # Contrast sync controller
+        self.stack_loaded = False
+        self._plate_contrast_limits = {}  # {channel_idx: (vmin, vmax)}
         
         # Load data from cache
         from .preprocessing import PlateAssembler
@@ -71,6 +80,13 @@ class TiffViewerWidget(QWidget):
         self._setup_tile_grid()
         self.setup_ui()
         self.update_image()
+        
+        # Check if Z×T stack exists, if not build it silently in background
+        if not self.plate_stack.exists(downsample_factor):
+            print("Z×T stack not found, building in background...")
+            self._build_stack_async()
+        else:
+            self._load_stack()
 
     def setup_ui(self):
         main_layout = QVBoxLayout()
@@ -103,7 +119,8 @@ class TiffViewerWidget(QWidget):
         # Right side: NDV embedded viewer
         if NDV_AVAILABLE:
             dummy_data = np.zeros((4, 100, 100), dtype=np.uint16)
-            self.ndv_viewer = ndv.ArrayViewer(dummy_data, channel_axis=0, channel_mode="composite")
+            # Set visible_axes to the spatial dims only (not channel)
+            self.ndv_viewer = ndv.ArrayViewer(dummy_data, channel_axis=0, channel_mode="composite", visible_axes=(-2, -1))
             splitter.addWidget(self.ndv_viewer.widget())
         else:
             placeholder = QLabel("NDV not available.\nInstall with: pip install ndv[vispy,pyqt]")
@@ -116,22 +133,60 @@ class TiffViewerWidget(QWidget):
         self.setLayout(main_layout)
     
     def _setup_tile_grid(self):
-        """Setup tile grid information from lightweight tile map"""
+        """Setup tile grid information, FOV boundaries, and well boundaries"""
         from types import SimpleNamespace
         
         # Extract tile dimensions from tile_map
         self.tile_h, self.tile_w = self.tile_map['tile_dimensions']
         
-        # Convert tile metadata dicts to SimpleNamespace objects for compatibility
+        # Build FOV boundary map: (region, fov) -> {x, y, w, h, center_x, center_y}
+        self.fov_boundaries = {}
+        
+        # Track region bounds for well-level grid
+        region_bounds = {}  # region -> {'min_x', 'max_x', 'min_y', 'max_y'}
+        
+        # Convert tile metadata and build spatial index
         self.grid_to_tile = {}
         for (grid_x, grid_y), tile_info in self.tile_map['grid_to_tile'].items():
             tile_obj = SimpleNamespace(
                 region=tile_info['region'],
                 fov=tile_info['fov'],
                 x_mm=tile_info['x_mm'],
-                y_mm=tile_info['y_mm']
+                y_mm=tile_info['y_mm'],
+                x_pixel=tile_info['x_pixel'],
+                y_pixel=tile_info['y_pixel']
             )
             self.grid_to_tile[(grid_x, grid_y)] = tile_obj
+            
+            # Build FOV boundary
+            key = (tile_info['region'], tile_info['fov'])
+            x, y = tile_info['x_pixel'], tile_info['y_pixel']
+            self.fov_boundaries[key] = {
+                'x': x,
+                'y': y,
+                'w': self.tile_w,
+                'h': self.tile_h,
+                'center_x': x + self.tile_w // 2,
+                'center_y': y + self.tile_h // 2
+            }
+            
+            # Update region bounds
+            region = tile_info['region']
+            if region not in region_bounds:
+                region_bounds[region] = {
+                    'min_x': x,
+                    'max_x': x + self.tile_w,
+                    'min_y': y,
+                    'max_y': y + self.tile_h
+                }
+            else:
+                region_bounds[region]['min_x'] = min(region_bounds[region]['min_x'], x)
+                region_bounds[region]['max_x'] = max(region_bounds[region]['max_x'], x + self.tile_w)
+                region_bounds[region]['min_y'] = min(region_bounds[region]['min_y'], y)
+                region_bounds[region]['max_y'] = max(region_bounds[region]['max_y'], y + self.tile_h)
+        
+        # Store well boundaries (one bounding box per region)
+        self.well_boundaries = region_bounds
         
         # Store FOV file index for O(1) lookup
         self.fov_to_files = self.tile_map['fov_to_files']
@@ -141,14 +196,43 @@ class TiffViewerWidget(QWidget):
         rgb_image = np.zeros((height, width, 3), dtype=np.uint8)
         
         for i, (channel, colormap) in enumerate(zip(self.multichannel_image, self.colormaps)):
-            normalized = self._normalize_channel(channel)
+            # Apply contrast limits if available, otherwise auto-contrast
+            if i in self._plate_contrast_limits:
+                vmin, vmax = self._plate_contrast_limits[i]
+                # Normalize from uint16 range with explicit limits
+                normalized = self._normalize_channel_with_limits_uint16(channel, vmin, vmax)
+            else:
+                normalized = self._normalize_channel(channel)
+            
             weights = COLOR_WEIGHTS.get(colormap, [0.5, 0.5, 0.5])
             for c in range(3):
                 rgb_image[:, :, c] = np.clip(rgb_image[:, :, c] + normalized * weights[c], 0, 255)
         
         return rgb_image
 
+    def _normalize_channel_with_limits_uint16(self, channel: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
+        """
+        Normalize uint16 channel with explicit contrast limits from NDV.
+        NDV provides limits in uint16 range (0-65535), we map to uint8 display (0-255).
+        """
+        # Ensure we're working with the right data type
+        if channel.dtype != np.uint16:
+            channel = channel.astype(np.uint16)
+        
+        # Clip to the uint16 contrast range
+        clipped = np.clip(channel, vmin, vmax)
+        
+        # Normalize to [0, 1]
+        if vmax > vmin:
+            normalized = (clipped.astype(np.float32) - vmin) / (vmax - vmin)
+        else:
+            normalized = np.zeros_like(clipped, dtype=np.float32)
+        
+        # Scale to [0, 255] for RGB display
+        return (normalized * 255).astype(np.uint8)
+    
     def _normalize_channel(self, channel: np.ndarray) -> np.ndarray:
+        """Auto-contrast normalization (fallback when no NDV limits set)"""
         if channel.dtype == np.uint8:
             return channel
         elif channel.dtype == np.uint16:
@@ -178,51 +262,64 @@ class TiffViewerWidget(QWidget):
         self.scale_y = self.multichannel_image.shape[1] / scaled_pixmap.height()
 
     def on_image_click(self, x, y):
+        """Handle click on plate image - find FOV and center red dot"""
         pixmap = self.image_label.pixmap()
-        if pixmap:
-            label_size = self.image_label.size()
-            pixmap_size = pixmap.size()
-            
-            offset_x = (label_size.width() - pixmap_size.width()) // 2
-            offset_y = (label_size.height() - pixmap_size.height()) // 2
-            
-            adjusted_x = x - offset_x - 50  # Account for well plate labels
-            adjusted_y = y - offset_y - 30
-            
-            if (0 <= adjusted_x < pixmap_size.width() - 50 and 
-                0 <= adjusted_y < pixmap_size.height() - 30):
-                img_x = int(adjusted_x * self.scale_x)
-                img_y = int(adjusted_y * self.scale_y)
-                
-                grid_x = img_x // self.tile_w
-                grid_y = img_y // self.tile_h
-                
-                if (grid_x, grid_y) in self.grid_to_tile:
-                    tile = self.grid_to_tile[(grid_x, grid_y)]
-                    fov_number = tile.fov
-                    region_name = tile.region
-                    self.status_label.setText(f"Creating zarr array for FOV {fov_number} in region {region_name}")
-                    
-                    self.clicked_position = (adjusted_x + 50, adjusted_y + 30)
-                    
-                    if NDV_AVAILABLE and hasattr(self, 'ndv_viewer'):
-                        try:
-                            fov_array = self.create_fov_zarr_array(fov_number, region_name)
-                            if fov_array is not None:
-                                self.set_ndv_data(fov_array)
-                            else:
-                                self.status_label.setText(f"Failed to create zarr array for FOV {fov_number}")
-                        except Exception as e:
-                            print(f"Error loading FOV zarr array into NDV viewer: {e}")
-                            self.status_label.setText(f"Error loading FOV {fov_number}")
-                    
-                    self.update_image()
-                else:
-                    self.status_label.setText("No tile found at this location")
-            else:
-                self.status_label.setText("Click outside image area")
-        else:
+        if not pixmap:
             self.status_label.setText("No image loaded")
+            return
+        
+        label_size = self.image_label.size()
+        pixmap_size = pixmap.size()
+        
+        offset_x = (label_size.width() - pixmap_size.width()) // 2
+        offset_y = (label_size.height() - pixmap_size.height()) // 2
+        
+        adjusted_x = x - offset_x - 50  # Account for well plate labels
+        adjusted_y = y - offset_y - 30
+        
+        if not (0 <= adjusted_x < pixmap_size.width() - 50 and 
+                0 <= adjusted_y < pixmap_size.height() - 30):
+            self.status_label.setText("Click outside image area")
+            return
+        
+        # Map to full-resolution image coordinates
+        img_x = int(adjusted_x * self.scale_x)
+        img_y = int(adjusted_y * self.scale_y)
+        
+        # Find which FOV was clicked using boundaries
+        clicked_fov = None
+        for (region, fov), bounds in self.fov_boundaries.items():
+            if (bounds['x'] <= img_x < bounds['x'] + bounds['w'] and
+                bounds['y'] <= img_y < bounds['y'] + bounds['h']):
+                clicked_fov = (region, fov)
+                break
+        
+        if not clicked_fov:
+            self.status_label.setText("No tile found at this location")
+            return
+        
+        region_name, fov_number = clicked_fov
+        bounds = self.fov_boundaries[clicked_fov]
+        
+        # Calculate display-space center position
+        center_x_scaled = bounds['center_x'] / self.scale_x + 50
+        center_y_scaled = bounds['center_y'] / self.scale_y + 30
+        self.clicked_position = (center_x_scaled, center_y_scaled)
+        
+        self.status_label.setText(f"Loading FOV {fov_number} in region {region_name}")
+        
+        if NDV_AVAILABLE and hasattr(self, 'ndv_viewer'):
+            try:
+                fov_array = self.create_fov_zarr_array(fov_number, region_name)
+                if fov_array is not None:
+                    self.set_ndv_data(fov_array)
+                else:
+                    self.status_label.setText(f"Failed to load FOV {fov_number}")
+            except Exception as e:
+                print(f"Error loading FOV: {e}")
+                self.status_label.setText(f"Error loading FOV {fov_number}")
+        
+        self.update_image()
     
     def _add_cyan_dot(self, pixmap, position):
         """Add a red dot at the specified position on the pixmap"""
@@ -264,7 +361,7 @@ class TiffViewerWidget(QWidget):
         return row_label + str(col + 1)
     
     def _add_well_plate_labels(self, pixmap):
-        """Add well plate row and column labels to the pixmap"""
+        """Add well plate row/column labels and FOV grid lines to the pixmap"""
         rows, cols = self._calculate_well_format()
         label_height, label_width = 30, 50
         total_width = pixmap.width() + label_width
@@ -277,6 +374,29 @@ class TiffViewerWidget(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
         painter.drawPixmap(label_width, label_height, pixmap)
         
+        # Calculate scale factor for drawing
+        scale_x = pixmap.width() / self.multichannel_image.shape[2]
+        scale_y = pixmap.height() / self.multichannel_image.shape[1]
+        
+        # Draw white grid lines at well (region) boundaries
+        painter.setPen(QPen(Qt.white, 1))
+        drawn_vertical = set()
+        drawn_horizontal = set()
+        
+        for region, bounds in self.well_boundaries.items():
+            # Right edge of well
+            x_right = int(bounds['max_x'] * scale_x) + label_width
+            if x_right not in drawn_vertical and x_right < total_width:
+                painter.drawLine(x_right, label_height, x_right, total_height)
+                drawn_vertical.add(x_right)
+            
+            # Bottom edge of well
+            y_bottom = int(bounds['max_y'] * scale_y) + label_height
+            if y_bottom not in drawn_horizontal and y_bottom < total_height:
+                painter.drawLine(label_width, y_bottom, total_width, y_bottom)
+                drawn_horizontal.add(y_bottom)
+        
+        # Draw well labels
         well_width = pixmap.width() / cols
         well_height = pixmap.height() / rows
         
@@ -335,17 +455,18 @@ class TiffViewerWidget(QWidget):
                     elif hasattr(self.ndv_viewer, 'data'):
                         self.ndv_viewer.data = data
                     else:
-                        if hasattr(data, 'chunks'):
-                            self._recreate_viewer_with_lazy_support(data, channel_axis, luts, current_state)
-                        else:
-                            self._recreate_viewer_with_state(data, channel_axis, luts, current_state)
+                        # Always recreate viewer to ensure proper dimension handling
+                        self._recreate_viewer_with_lazy_support(data, channel_axis, luts, current_state)
                 except Exception as e:
                     print(f"Direct data update failed, recreating viewer: {e}")
-                    if hasattr(data, 'chunks'):
-                        self._recreate_viewer_with_lazy_support(data, channel_axis, luts, current_state)
+                    self._recreate_viewer_with_lazy_support(data, channel_axis, luts, current_state)
                 
                 self._restore_viewer_state(current_state)
                 self._ensure_composite_mode_and_luts(luts)
+                
+                # Initialize NDV sync controller if not already done
+                if self.ndv_sync is None and self.stack_loaded:
+                    self._init_ndv_sync()
                 
             except Exception as e:
                 print(f"Error setting lazy data in NDV viewer: {e}")
@@ -408,14 +529,33 @@ class TiffViewerWidget(QWidget):
             old_widget = self.ndv_viewer.widget()
             old_widget.setParent(None)
         
+        # Determine visible_axes (should be just the 2D spatial display dimensions)
+        # This tells NDV which axes to display in the canvas.
+        # All other axes (time, z_level, etc.) will automatically get sliders.
+        visible_axes = ('y', 'x')  # Default to 2D display
+        if hasattr(data, 'dims'):
+            # Always use just y, x for 2D display so time and z get sliders
+            visible_axes = tuple(d for d in ['y', 'x'] if d in data.dims)
+            slider_dims = [d for d in data.dims if d not in visible_axes]
+            if channel_axis is not None and channel_axis < len(data.dims):
+                channel_dim_name = data.dims[channel_axis]
+                slider_dims = [d for d in slider_dims if d != channel_dim_name]
+            print(f"Data dimensions: {data.dims}, visible_axes: {visible_axes}")
+            print(f"Dimensions that will have sliders: {slider_dims}")
+        
         if channel_axis is not None:
             self.ndv_viewer = ndv.ArrayViewer(data, channel_axis=channel_axis, 
-                                             channel_mode="composite", luts=luts)
+                                             channel_mode="composite", luts=luts,
+                                             visible_axes=visible_axes)
         
         splitter = self.parent().findChild(QSplitter)
         if splitter:
             splitter.addWidget(self.ndv_viewer.widget())
             splitter.setSizes([600, 400])
+        
+        # Initialize NDV sync after viewer is created (if stack is loaded)
+        if self.stack_loaded and self.ndv_sync is None:
+            self._init_ndv_sync()
     
     def _ensure_composite_mode_and_luts(self, luts):
         """Ensure the viewer is in composite mode and has the correct LUTs applied"""
@@ -461,30 +601,29 @@ class TiffViewerWidget(QWidget):
             #         print(f"Error loading flatfields: {e}")
             #         flatfield_data = None
             
-            # O(1) lookup using pre-built FOV file index
+            # Scan for files from ALL timepoints for this FOV
+            # Note: fov_to_files only contains current timepoint, so we need to scan all timepoints
             base_path = Path(self.base_path)
-            fov_key = (target_region, target_fov)
+            fov_files = []
             
-            if fov_key not in self.fov_to_files:
-                print(f"FOV {target_fov} in region {target_region} not found in tile map")
-                # Fallback: try scanning for files if not in index
-                all_tiffs = list(base_path.rglob("*.tiff"))
-                fov_files = []
-                for tiff_path in all_tiffs:
-                    if m := fpattern.search(tiff_path.name):
-                        fov = int(m.group("f"))
-                        region = m.group("r")
-                        if fov == target_fov and (target_region is None or region == target_region):
-                            fov_files.append(str(tiff_path))
-            else:
-                # Fast path: get files directly from index
-                fov_files = list(self.fov_to_files[fov_key].values())
+            # Look through all timepoint directories
+            for timepoint_dir in base_path.iterdir():
+                if timepoint_dir.is_dir() and timepoint_dir.name.isdigit():
+                    # Scan this timepoint for matching FOV files
+                    for tiff_path in timepoint_dir.glob("*.tiff"):
+                        if m := fpattern.search(tiff_path.name):
+                            fov = int(m.group("f"))
+                            region = m.group("r")
+                            if fov == target_fov and (target_region is None or region == target_region):
+                                fov_files.append(str(tiff_path))
             
             if not fov_files:
                 print(f"No files found for FOV {target_fov} in region {target_region}")
                 return None
             
+            print(f"Found {len(fov_files)} files for FOV {target_fov} in region {target_region}")
             axes, shape, indices, sorted_files = parse_filenames(fov_files)
+            print(f"Parsed dimensions - axes: {axes}, shape: {shape}")
             sample_tiff = tf.TiffFile(sorted_files[0])
             sample_shape = sample_tiff.pages[0].shape
             height, width = sample_shape[-2:]
@@ -580,6 +719,119 @@ class TiffViewerWidget(QWidget):
             import traceback
             traceback.print_exc()
             return None
+    
+    def _build_stack_async(self):
+        """Build stack in background thread (non-blocking)"""
+        # Create builder thread
+        self.builder_thread = StackBuilderThread(
+            self.base_path,
+            self.cache_dir,
+            self.downsample_factor
+        )
+        
+        # Connect signals
+        self.builder_thread.progress.connect(self._on_build_progress)
+        self.builder_thread.finished.connect(self._on_build_finished)
+        
+        # Start building
+        self.builder_thread.start()
+        
+        # Update status
+        if hasattr(self, 'status_label'):
+            self.status_label.setText("Building Z×T stack in background...")
+    
+    def _on_build_progress(self, message: str):
+        """Update status label with build progress"""
+        if hasattr(self, 'status_label'):
+            self.status_label.setText(f"Building stack: {message}")
+    
+    def _on_build_finished(self, success: bool, message: str):
+        """Handle completion of stack building"""
+        if success:
+            self._load_stack()
+        else:
+            print(f"Error: Stack build failed - {message}")
+            if hasattr(self, 'status_label'):
+                self.status_label.setText("Z×T stack build failed - single plane mode")
+    
+    def _load_stack(self):
+        """Load the pre-built Z×T stack"""
+        if self.plate_stack.load_stack(self.downsample_factor):
+            self.stack_loaded = True
+            
+            # Update status
+            if hasattr(self, 'status_label'):
+                metadata = self.plate_stack.get_metadata()
+                if metadata:
+                    n_t = len(metadata['timepoints'])
+                    n_z = len(metadata['z_levels'])
+                    self.status_label.setText(
+                        f"Z×T stack ready: {n_t} timepoints × {n_z} z-levels. "
+                        "Click tile, use sliders to navigate."
+                    )
+        else:
+            print("Warning: Could not load Z×T stack")
+            self.stack_label = False
+    
+    def _init_ndv_sync(self):
+        """Initialize NDV synchronization controllers"""
+        if not NDV_AVAILABLE or not hasattr(self, 'ndv_viewer'):
+            return
+        
+        try:
+            # Z/T slider sync
+            self.ndv_sync = NDVSyncController(self.ndv_viewer, self)
+            self.ndv_sync.indices_changed.connect(self._on_ndv_indices_changed)
+            self.ndv_sync.connect_to_viewer()
+            
+            # Contrast sync
+            self.ndv_contrast_sync = NDVContrastSyncController(self.ndv_viewer, self)
+            self.ndv_contrast_sync.contrast_changed.connect(self._on_ndv_contrast_changed)
+            self.ndv_contrast_sync.connect_to_viewer()
+            
+        except Exception as e:
+            print(f"Warning: Could not initialize NDV sync: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _on_ndv_indices_changed(self, t_idx: int, z_idx: int):
+        """
+        Callback when NDV z/t sliders change.
+        Update the left-side plate image to match.
+        """
+        if not self.stack_loaded:
+            return
+        
+        # Get corresponding plate page from stack
+        plate_page = self.plate_stack.get_page(t_idx, z_idx)
+        
+        if plate_page is not None:
+            # Update the displayed multichannel image
+            self.multichannel_image = plate_page
+            self.update_image()
+            
+            # Update status
+            metadata = self.plate_stack.get_metadata()
+            if metadata:
+                actual_t = metadata['timepoints'][t_idx]
+                actual_z = metadata['z_levels'][z_idx]
+                self.status_label.setText(
+                    f"Viewing: T={actual_t}, Z={actual_z}"
+                )
+    
+    def _on_ndv_contrast_changed(self, channel_idx: int, vmin: float, vmax: float):
+        """
+        Callback when NDV contrast sliders change.
+        Update plate view contrast for this channel.
+        """
+        if vmin == -1.0 and vmax == -1.0:
+            if channel_idx in self._plate_contrast_limits:
+                del self._plate_contrast_limits[channel_idx]
+        else:
+            self._plate_contrast_limits[channel_idx] = (vmin, vmax)
+        
+        # Trigger plate image refresh
+        self.update_image()
 
 
 class ViewerMainWindow(QMainWindow):

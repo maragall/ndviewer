@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QLabel, QSplitter,
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen
 from PyQt5.QtCore import Qt, pyqtSignal
 
-from .common import COLOR_WEIGHTS, parse_filenames, fpattern
+from .common import COLOR_WEIGHTS, parse_filenames, fpattern, fpattern_ome, detect_acquisition_format
 from .plate_stack import PlateStackManager, StackBuilderThread, NDVSyncController, NDVContrastSyncController
 
 # NDV and zarr imports
@@ -193,22 +193,49 @@ class TiffViewerWidget(QWidget):
 
     def _create_color_image(self) -> np.ndarray:
         channels, height, width = self.multichannel_image.shape
-        rgb_image = np.zeros((height, width, 3), dtype=np.uint8)
+        rgb_image = np.zeros((height, width, 3), dtype=np.float32)
         
         for i, (channel, colormap) in enumerate(zip(self.multichannel_image, self.colormaps)):
-            # Apply contrast limits if available, otherwise auto-contrast
+            # Keep in uint16 space, apply contrast limits
+            # Try to get contrast limits - check cache first, then read from NDV
+            if i not in self._plate_contrast_limits and hasattr(self, 'ndv_viewer'):
+                try:
+                    lut = self.ndv_viewer.display_model.luts.get(i)
+                    if lut and hasattr(lut, 'clims'):
+                        clims = lut.clims
+                        if hasattr(clims, 'computed'):
+                            vmin, vmax = clims.computed()
+                            self._plate_contrast_limits[i] = (float(vmin), float(vmax))
+                except:
+                    pass
+            
             if i in self._plate_contrast_limits:
                 vmin, vmax = self._plate_contrast_limits[i]
-                # Normalize from uint16 range with explicit limits
-                normalized = self._normalize_channel_with_limits_uint16(channel, vmin, vmax)
+                # Clip to contrast limits (uint16 range)
+                clipped = np.clip(channel.astype(np.float32), vmin, vmax)
+                # Normalize to [0, 1] in 16-bit space
+                if vmax > vmin:
+                    normalized_float = (clipped - vmin) / (vmax - vmin)
+                else:
+                    normalized_float = np.zeros_like(clipped, dtype=np.float32)
             else:
-                normalized = self._normalize_channel(channel)
+                # Auto-contrast in uint16 space
+                if channel.dtype == np.uint16:
+                    p2, p98 = np.percentile(channel, (2, 98))
+                    if p98 > p2:
+                        normalized_float = np.clip((channel.astype(np.float32) - p2) / (p98 - p2), 0, 1)
+                    else:
+                        normalized_float = channel.astype(np.float32) / 65535.0
+                else:
+                    normalized_float = channel.astype(np.float32) / 255.0
             
+            # Apply color weights - NDV uses additive blending
             weights = COLOR_WEIGHTS.get(colormap, [0.5, 0.5, 0.5])
             for c in range(3):
-                rgb_image[:, :, c] = np.clip(rgb_image[:, :, c] + normalized * weights[c], 0, 255)
+                rgb_image[:, :, c] += normalized_float * weights[c]
         
-        return rgb_image
+        # Clip and convert to uint8 for display
+        return (np.clip(rgb_image, 0, 1) * 255).astype(np.uint8)
 
     def _normalize_channel_with_limits_uint16(self, channel: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
         """
@@ -437,7 +464,12 @@ class TiffViewerWidget(QWidget):
         """Enhanced version that handles lazy arrays properly"""
         if NDV_AVAILABLE and hasattr(self, 'ndv_viewer'):
             try:
-                luts = self._create_ndv_luts()
+                # Get LUTs - prefer from xarray attrs (OME), fallback to colormaps (single-TIFF)
+                if hasattr(data, 'attrs') and 'luts' in data.attrs:
+                    luts = data.attrs['luts']
+                else:
+                    luts = self._create_ndv_luts()
+                
                 channel_axis = None
                 if hasattr(data, 'dims'):
                     try:
@@ -584,6 +616,15 @@ class TiffViewerWidget(QWidget):
             print("Zarr/tifffile/xarray not available")
             return None
         
+        # Detect format and route to appropriate loader
+        format_type = detect_acquisition_format(Path(self.base_path))
+        if format_type == 'ome_tiff':
+            return self._create_fov_from_ome(target_fov, target_region)
+        else:
+            return self._create_fov_from_single_tiff(target_fov, target_region)
+    
+    def _create_fov_from_single_tiff(self, target_fov: int, target_region: str = None) -> Optional[xr.DataArray]:
+        """Load FOV from single-TIFF files (current format)"""
         try:
             # # Load flatfields if available - DISABLED (Less is more)
             # flatfield_data = None
@@ -720,6 +761,159 @@ class TiffViewerWidget(QWidget):
             traceback.print_exc()
             return None
     
+    def _create_fov_from_ome(self, target_fov: int, target_region: str = None) -> Optional[xr.DataArray]:
+        """Load FOV from OME-TIFF files (new format)"""
+        try:
+            base_path = Path(self.base_path)
+            
+            # OME-TIFF files contain all timepoints internally, so just find the file in first timepoint dir
+            first_tp = base_path / "0"
+            ome_file = None
+            
+            for ome_path in first_tp.glob("*.ome.tif*"):
+                if m := fpattern_ome.search(ome_path.name):
+                    region, fov = m.group("r"), int(m.group("f"))
+                    if fov == target_fov and (target_region is None or region == target_region):
+                        ome_file = str(ome_path)
+                        break
+            
+            if not ome_file:
+                print(f"No OME-TIFF file found for FOV {target_fov} in region {target_region}")
+                return None
+            
+            # Read metadata from the OME file
+            with tf.TiffFile(ome_file) as tif:
+                sample_data = tif.asarray()
+                
+                # Parse OME metadata to understand dimension order
+                dim_order = 'XYCZT'  # Default
+                size_c, size_z, size_t = 1, 1, 1
+                
+                if tif.is_ome and tif.ome_metadata:
+                    import xml.etree.ElementTree as ET
+                    root = ET.fromstring(tif.ome_metadata)
+                    ns = {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
+                    pixels = root.find('.//ome:Pixels', ns)
+                    if pixels:
+                        dim_order = pixels.get('DimensionOrder', 'XYCZT')
+                        size_c = int(pixels.get('SizeC', 1))
+                        size_z = int(pixels.get('SizeZ', 1))
+                        size_t = int(pixels.get('SizeT', 1))
+                
+                # Tifffile returns array based on dimension order
+                # For XYCZT order with shape (T, Z, C, Y, X), we need to transpose to (C, Z, T, Y, X)
+                if dim_order == 'XYCZT' and len(sample_data.shape) == 5:
+                    # Shape is (T, Z, C, Y, X), transpose to (C, Z, T, Y, X)
+                    sample_data = np.transpose(sample_data, (2, 1, 0, 3, 4))
+                elif len(sample_data.shape) == 3:
+                    # (Z, Y, X) - single channel, single T
+                    sample_data = sample_data[np.newaxis, :, np.newaxis, :, :]
+                elif len(sample_data.shape) == 4:
+                    # Could be (C, Z, Y, X) or (Z, C, Y, X) - add T dimension
+                    sample_data = sample_data[:, :, np.newaxis, :, :]
+                
+                n_channels, n_z, n_timepoints, height, width = sample_data.shape
+                
+                # Extract channel names from OME metadata
+                channel_names = []
+                if tif.is_ome and tif.ome_metadata:
+                    import xml.etree.ElementTree as ET
+                    root = ET.fromstring(tif.ome_metadata)
+                    ns = {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
+                    pixels = root.find('.//ome:Pixels', ns)
+                    if pixels:
+                        for ch in pixels.findall('ome:Channel', ns):
+                            channel_names.append(ch.get('Name', ''))
+            
+            print(f"Found OME-TIFF for FOV {target_fov}: C={n_channels}, Z={n_z}, T={n_timepoints}")
+            
+            # Build colormap LUTs from channel names
+            from .common import COLOR_MAPS
+            luts = {}
+            default_colors = ['blue', 'green', 'yellow', 'red', 'darkred']  # Ch0-4, then gray
+            
+            for i in range(n_channels):
+                name = channel_names[i] if i < len(channel_names) else f'Channel_{i}'
+                colormap = None
+                
+                # Try to extract wavelength from name
+                for wl_key, color in COLOR_MAPS.items():
+                    if wl_key in name:
+                        colormap = color
+                        break
+                
+                # If no wavelength found, use default color palette
+                if colormap is None:
+                    if i < len(default_colors):
+                        colormap = default_colors[i]
+                    else:
+                        colormap = 'gray'  # Ch5+ get gray
+                
+                luts[i] = colormap
+            
+            # Build lazy dask array structure: (time, z_level, channel, y, x)
+            def load_ome_slice(filepath, c_idx, z_idx, t_idx, dim_order):
+                def _load():
+                    try:
+                        with tf.TiffFile(filepath) as tif:
+                            data = tif.asarray()
+                            
+                            # Transpose based on dimension order
+                            if dim_order == 'XYCZT' and len(data.shape) == 5:
+                                # (T, Z, C, Y, X) -> (C, Z, T, Y, X)
+                                data = np.transpose(data, (2, 1, 0, 3, 4))
+                            elif len(data.shape) == 3:
+                                # (Z, Y, X) - single channel
+                                data = data[np.newaxis, :, np.newaxis, :, :]
+                            elif len(data.shape) == 4:
+                                # (C, Z, Y, X) or similar - add T dim
+                                data = data[:, :, np.newaxis, :, :]
+                            
+                            # Now data is (C, Z, T, Y, X)
+                            return data[c_idx, z_idx, t_idx, :, :]
+                    except Exception as e:
+                        print(f"Error loading OME slice: {e}")
+                        return np.zeros((height, width), dtype=np.uint16)
+                return _load
+            
+            time_arrays = []
+            for t in range(n_timepoints):
+                z_arrays = []
+                for z in range(n_z):
+                    channel_arrays = []
+                    for c in range(n_channels):
+                        delayed_load = delayed(load_ome_slice(ome_file, c, z, t, dim_order))
+                        dask_chunk = da.from_delayed(delayed_load(), shape=(height, width), dtype=np.uint16)
+                        channel_arrays.append(dask_chunk)
+                    z_arrays.append(da.stack(channel_arrays, axis=0))
+                time_arrays.append(da.stack(z_arrays, axis=0))
+            
+            full_array = da.stack(time_arrays, axis=0)
+            
+            # Create xarray with proper dimensions
+            xarr = xr.DataArray(
+                full_array,
+                dims=['time', 'z_level', 'channel', 'y', 'x'],
+                coords={
+                    'time': list(range(n_timepoints)),
+                    'z_level': list(range(n_z)),
+                    'channel': list(range(n_channels))
+                }
+            )
+            
+            print(f"Created OME lazy xarray with shape: {xarr.shape}")
+            
+            # Store LUTs as attribute for set_ndv_data to use
+            xarr.attrs['luts'] = luts
+            
+            return xarr
+            
+        except Exception as e:
+            print(f"Error creating OME FOV xarray: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
     def _build_stack_async(self):
         """Build stack in background thread (non-blocking)"""
         # Create builder thread
@@ -759,9 +953,15 @@ class TiffViewerWidget(QWidget):
         if self.plate_stack.load_stack(self.downsample_factor):
             self.stack_loaded = True
             
+            # Extract colormaps from stack metadata
+            metadata = self.plate_stack.get_metadata()
+            if metadata and 'shape_info' in metadata and metadata['shape_info']:
+                self.wavelengths = metadata['shape_info']['wavelengths']
+                self.colormaps = metadata['shape_info']['colormaps']
+                print(f"[Stack] Using {len(self.colormaps)} channel colormaps: {self.colormaps}")
+            
             # Update status
             if hasattr(self, 'status_label'):
-                metadata = self.plate_stack.get_metadata()
                 if metadata:
                     n_t = len(metadata['timepoints'])
                     n_z = len(metadata['z_levels'])
@@ -779,6 +979,9 @@ class TiffViewerWidget(QWidget):
             return
         
         try:
+            # Initialize plate contrast limits from NDV's initial state
+            self._sync_initial_contrast_from_ndv()
+            
             # Z/T slider sync
             self.ndv_sync = NDVSyncController(self.ndv_viewer, self)
             self.ndv_sync.indices_changed.connect(self._on_ndv_indices_changed)
@@ -793,6 +996,52 @@ class TiffViewerWidget(QWidget):
             print(f"Warning: Could not initialize NDV sync: {e}")
             import traceback
             traceback.print_exc()
+    
+    def _sync_initial_contrast_from_ndv(self):
+        """Read NDV's initial contrast limits and apply to plate image"""
+        from PyQt5.QtCore import QTimer
+        
+        def _delayed_sync():
+            """Sync after a delay to ensure all channel data is loaded"""
+            try:
+                if not hasattr(self.ndv_viewer, 'display_model'):
+                    return
+                
+                dm = self.ndv_viewer.display_model
+                if not hasattr(dm, 'luts'):
+                    return
+                
+                luts = dm.luts
+                synced_count = 0
+                
+                for ch_idx, lut_model in luts.items():
+                    if hasattr(lut_model, 'clims'):
+                        clims = lut_model.clims
+                        # Get actual contrast values - use computed() for auto, or min/max for manual
+                        try:
+                            if hasattr(clims, 'computed'):
+                                vmin, vmax = clims.computed()
+                            elif hasattr(clims, 'min') and hasattr(clims, 'max'):
+                                vmin, vmax = float(clims.min), float(clims.max)
+                            else:
+                                continue
+                            
+                            self._plate_contrast_limits[ch_idx] = (float(vmin), float(vmax))
+                            print(f"[Init] Ch{ch_idx} contrast from NDV: [{vmin:.0f}, {vmax:.0f}]")
+                            synced_count += 1
+                        except Exception as e:
+                            print(f"[Init] Ch{ch_idx} contrast failed: {e}")
+                
+                # Update plate display with NDV's initial contrast
+                if synced_count > 0:
+                    print(f"[Init] Synced {synced_count}/{len(luts)} channels, updating plate")
+                    self.update_image()
+                    
+            except Exception as e:
+                print(f"Warning: Could not sync initial contrast from NDV: {e}")
+        
+        # Delay to let NDV compute contrast for all channels
+        QTimer.singleShot(500, _delayed_sync)
     
     def _on_ndv_indices_changed(self, t_idx: int, z_idx: int):
         """

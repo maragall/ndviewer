@@ -22,3 +22,4 @@ dependencies:
       - superqt==0.7.3
       - pyconify==0.2.1
       - vispy==0.14.3
+      - imagecodecs

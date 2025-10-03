@@ -766,8 +766,9 @@ class TiffViewerWidget(QWidget):
         try:
             base_path = Path(self.base_path)
             
-            # OME-TIFF files contain all timepoints internally, so just find the file in first timepoint dir
-            first_tp = base_path / "0"
+            # OME-TIFF files contain all timepoints internally
+            # Check for OME-TIFF in ome_tiff/ directory or fallback to 0/
+            first_tp = base_path / "ome_tiff" if (base_path / "ome_tiff").exists() else base_path / "0"
             ome_file = None
             
             for ome_path in first_tp.glob("*.ome.tif*"):

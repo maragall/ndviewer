@@ -276,10 +276,10 @@ class PlateAssembler:
     
     def _load_tiles_from_ome(self, downsample_factor: float, skip_downsampling: bool, z_level: int = 0) -> Dict:
         """Load tiles from OME-TIFF files for specific z-level"""
-        # For OME-TIFF, all timepoints are in files in directory 0/
-        # Use timepoint index to extract from internal T dimension
-        ome_dir = self.base_path / "0"
-        coords_df = pd.read_csv(ome_dir / "coordinates.csv")
+        # For OME-TIFF, files are in ome_tiff/ directory or fallback to 0/
+        ome_dir = self.base_path / "ome_tiff" if (self.base_path / "ome_tiff").exists() else self.base_path / "0"
+        coords_path = self.base_path / "0" / "coordinates.csv"
+        coords_df = pd.read_csv(coords_path)
         tiles = {}
         
         for ome_file in ome_dir.glob("*.ome.tif*"):

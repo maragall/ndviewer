@@ -259,7 +259,8 @@ class StackBuilderThread(QThread):
         
         if format_type == 'ome_tiff':
             # Get z-levels from OME-TIFF metadata
-            for ome_file in first_tp.glob("*.ome.tif*"):
+            ome_dir = self.base_path / "ome_tiff" if (self.base_path / "ome_tiff").exists() else self.base_path / "0"
+            for ome_file in ome_dir.glob("*.ome.tif*"):
                 try:
                     with tf.TiffFile(str(ome_file)) as tif:
                         data = tif.asarray()

@@ -73,6 +73,14 @@ def parse_filenames(filenames: Sequence[str]) -> tuple:
 
 def detect_acquisition_format(base_path: Path) -> str:
     """Detect if acquisition uses single-TIFF or OME-TIFF format"""
+    # Check for ome_tiff/ directory first
+    ome_dir = base_path / "ome_tiff"
+    if ome_dir.exists() and ome_dir.is_dir():
+        has_ome = any(f.suffix in ['.tif', '.tiff'] and '.ome' in f.name for f in ome_dir.glob('*.tif*'))
+        if has_ome:
+            return 'ome_tiff'
+    
+    # Fallback: check in timepoint directories
     first_tp = next((d for d in base_path.iterdir() if d.is_dir() and d.name.isdigit()), None)
     if first_tp:
         has_ome = any(f.suffix in ['.tif', '.tiff'] and '.ome' in f.name for f in first_tp.glob('*.tif*'))

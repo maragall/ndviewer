@@ -9,11 +9,14 @@ import numpy as np
 # Constants
 WELL_FORMATS = {4: (2, 2), 6: (2, 3), 12: (3, 4), 24: (4, 6), 96: (8, 12), 384: (16, 24), 1536: (32, 48)}
 COLOR_MAPS = {'405': 'blue', '488': 'green', '561': 'yellow', '638': 'red', '640': 'red'}
-COLOR_WEIGHTS = {'red': [1, 0, 0], 'green': [0, 1, 0], 'blue': [0, 0, 1], 'yellow': [1, 1, 0], 'gray': [0.5, 0.5, 0.5]}
+COLOR_WEIGHTS = {'red': [1, 0, 0], 'green': [0, 1, 0], 'blue': [0, 0, 1], 'yellow': [1, 1, 0], 'darkred': [0.5, 0, 0], 'gray': [0.5, 0.5, 0.5]}
 
-# Filename pattern
+# Filename patterns
 fpattern = re.compile(
     r"(?P<r>[^_]+)_(?P<f>\d+)_(?P<z>\d+)_(?P<c>.+)\.tiff?", re.IGNORECASE
+)
+fpattern_ome = re.compile(
+    r"(?P<r>[^_]+)_(?P<f>\d+)\.ome\.tiff?", re.IGNORECASE
 )
 
 @dataclass
@@ -67,6 +70,22 @@ def parse_filenames(filenames: Sequence[str]) -> tuple:
         indices.append((t_idx, r_idx, f_idx, z_idx, c_idx))
 
     return axes, shape, indices, sorted_files
+
+def detect_acquisition_format(base_path: Path) -> str:
+    """Detect if acquisition uses single-TIFF or OME-TIFF format"""
+    # Check for ome_tiff/ directory first
+    ome_dir = base_path / "ome_tiff"
+    if ome_dir.exists() and ome_dir.is_dir():
+        has_ome = any(f.suffix in ['.tif', '.tiff'] and '.ome' in f.name for f in ome_dir.glob('*.tif*'))
+        if has_ome:
+            return 'ome_tiff'
+    
+    # Fallback: check in timepoint directories
+    first_tp = next((d for d in base_path.iterdir() if d.is_dir() and d.name.isdigit()), None)
+    if first_tp:
+        has_ome = any(f.suffix in ['.tif', '.tiff'] and '.ome' in f.name for f in first_tp.glob('*.tif*'))
+        return 'ome_tiff' if has_ome else 'single_tiff'
+    return 'single_tiff'
 
 class ImageProcessor:
     @staticmethod

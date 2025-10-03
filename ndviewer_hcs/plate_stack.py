@@ -243,7 +243,8 @@ class StackBuilderThread(QThread):
     
     def _detect_z_levels(self) -> List[int]:
         """Detect available z-levels from first timepoint"""
-        from .common import fpattern
+        from .common import fpattern, fpattern_ome, detect_acquisition_format
+        import tifffile as tf
         
         # Look in first timepoint directory
         timepoints = self._detect_timepoints()
@@ -253,72 +254,53 @@ class StackBuilderThread(QThread):
         first_tp = self.base_path / str(timepoints[0])
         z_levels = set()
         
-        for tiff_file in first_tp.glob("*.tiff"):
-            if m := fpattern.search(tiff_file.name):
-                z = int(m.group("z"))
-                z_levels.add(z)
+        # Check format
+        format_type = detect_acquisition_format(self.base_path)
+        
+        if format_type == 'ome_tiff':
+            # Get z-levels from OME-TIFF metadata
+            ome_dir = self.base_path / "ome_tiff" if (self.base_path / "ome_tiff").exists() else self.base_path / "0"
+            for ome_file in ome_dir.glob("*.ome.tif*"):
+                try:
+                    with tf.TiffFile(str(ome_file)) as tif:
+                        data = tif.asarray()
+                        # Handle different shapes
+                        if len(data.shape) >= 2:
+                            n_z = data.shape[1] if len(data.shape) >= 2 else 1
+                            z_levels.update(range(n_z))
+                    break  # Only need to check one file
+                except:
+                    pass
+        else:
+            # Single-TIFF: parse from filenames
+            for tiff_file in first_tp.glob("*.tiff"):
+                if m := fpattern.search(tiff_file.name):
+                    z = int(m.group("z"))
+                    z_levels.add(z)
         
         return sorted(list(z_levels))
     
     def _assemble_plate_for_tz(self, timepoint: int, z_level: int) -> Optional[Dict]:
         """Assemble plate for specific timepoint and z-level"""
         from .preprocessing import PlateAssembler
-        from .common import fpattern
-        import pandas as pd
-        from skimage import io
+        from .common import detect_acquisition_format
         
-        # Load tiles for this specific (t, z)
-        timepoint_path = self.base_path / str(timepoint)
-        if not timepoint_path.exists():
-            return None
-        
-        coords_file = timepoint_path / "coordinates.csv"
-        if not coords_file.exists():
-            return None
-        
-        coords_df = pd.read_csv(coords_file)
-        
-        # Use PlateAssembler infrastructure but filter for specific z
+        # Use PlateAssembler with z_level parameter
         assembler = PlateAssembler(str(self.base_path), timepoint=timepoint)
         
         # Get target pixel size
         original_px = assembler._get_original_pixel_size()
         target_px = int(original_px * self.downsample_factor)
+        skip_downsampling = self.downsample_factor >= 0.98
         
-        # Load tiles but filter for this z-level only
-        tiles = {}
-        for filepath in timepoint_path.glob("*.tiff"):
-            if m := fpattern.search(filepath.name):
-                region = m.group("r")
-                fov = int(m.group("f"))
-                z = int(m.group("z"))
-                channel = m.group("c")
-                
-                # Filter: only this z-level
-                if z != z_level:
-                    continue
-                
-                coord_row = coords_df[(coords_df['region'] == region) & (coords_df['fov'] == fov)]
-                if coord_row.empty:
-                    continue
-                
-                img = io.imread(filepath)
-                
-                # Downsample
-                if self.downsample_factor < 0.98:
-                    from .common import ImageProcessor
-                    img = ImageProcessor.downsample_fast(img, target_px)
-                
-                from .common import TileData
-                tiles[(region, fov, channel)] = TileData(
-                    image=img,
-                    x_mm=coord_row['x (mm)'].iloc[0],
-                    y_mm=coord_row['y (mm)'].iloc[0],
-                    file_path=str(filepath),
-                    region=region,
-                    fov=fov,
-                    wavelength=channel
-                )
+        # Load tiles for this specific z-level
+        # _load_tiles now handles both single-TIFF and OME-TIFF
+        tiles = assembler._load_tiles(
+            flatfields=None,
+            downsample_factor=self.downsample_factor,
+            skip_downsampling=skip_downsampling,
+            z_level=z_level
+        )
         
         if not tiles:
             return None

@@ -12,7 +12,8 @@ import matplotlib.pyplot as plt
 from skimage import io
 # from basicpy import BaSiC
 
-from .common import TileData, ImageProcessor, COLOR_MAPS
+from .common import TileData, ImageProcessor, COLOR_MAPS, detect_acquisition_format, fpattern_ome
+import tifffile as tf
 
 class FlatfieldManager:
     """Manages flatfield computation and caching"""
@@ -176,10 +177,8 @@ class PlateAssembler:
     def _load_from_cache(self, cache_key: str) -> Tuple[Dict, Dict]:
         with open(self.cache_dir / f"{cache_key}_tile_map.pkl", 'rb') as f:
             tile_map = pickle.load(f)
-        multichannel_image = io.imread(self.cache_dir / f"{cache_key}_multichannel.tiff")
-        
-        if len(multichannel_image.shape) == 3 and multichannel_image.shape[2] <= 10:
-            multichannel_image = np.transpose(multichannel_image, (2, 0, 1))
+        # Use tifffile to preserve (C, H, W) axis order
+        multichannel_image = tf.imread(self.cache_dir / f"{cache_key}_multichannel.tiff")
         
         with open(self.cache_dir / f"{cache_key}_metadata.pkl", 'rb') as f:
             metadata = pickle.load(f)
@@ -196,11 +195,10 @@ class PlateAssembler:
             pickle.dump(tile_map, f)
         
         multichannel_image = assembled_images['multichannel']
-        if len(multichannel_image.shape) == 3 and multichannel_image.shape[0] <= 10:
-            multichannel_image = np.transpose(multichannel_image, (1, 2, 0))
         
+        # Use tifffile.imwrite to preserve (C, H, W) axis order
         compression = 'lzw' if multichannel_image.dtype == np.uint16 else None
-        io.imsave(self.cache_dir / f"{cache_key}_multichannel.tiff", multichannel_image, compression=compression)
+        tf.imwrite(self.cache_dir / f"{cache_key}_multichannel.tiff", multichannel_image, compression=compression, photometric='minisblack')
         
         metadata = {k: assembled_images[k] for k in ['wavelengths', 'colormaps']}
         with open(self.cache_dir / f"{cache_key}_metadata.pkl", 'wb') as f:
@@ -208,7 +206,7 @@ class PlateAssembler:
         
         # ALSO save downsampled plate to downsampled_image folder
         plate_tiff_path = self.output_dir / "assembled_plate_downsampled.tiff"
-        io.imsave(plate_tiff_path, multichannel_image, compression=compression)
+        tf.imwrite(plate_tiff_path, multichannel_image, compression=compression, photometric='minisblack')
         print(f"Saved downsampled plate to: {plate_tiff_path}")
     
     def _save_metadata(self, target_pixel_size: int):
@@ -224,10 +222,20 @@ class PlateAssembler:
         return match.groups() if match else None
     
     def _get_colormap(self, wavelength: str) -> str:
+        """Get colormap for wavelength"""
         return next((color for wl, color in COLOR_MAPS.items() if wl in wavelength), 'gray')
     
-    def _load_tiles(self, flatfields: Dict, downsample_factor: float, skip_downsampling: bool) -> Dict:
+    def _load_tiles(self, flatfields: Dict, downsample_factor: float, skip_downsampling: bool, z_level: int = 0) -> Dict:
         """Load tiles with optional flatfield correction and downsampling"""
+        format_type = detect_acquisition_format(self.base_path)
+        
+        if format_type == 'ome_tiff':
+            return self._load_tiles_from_ome(downsample_factor, skip_downsampling, z_level)
+        else:
+            return self._load_tiles_from_single_tiff(flatfields, downsample_factor, skip_downsampling)
+    
+    def _load_tiles_from_single_tiff(self, flatfields: Dict, downsample_factor: float, skip_downsampling: bool) -> Dict:
+        """Load tiles from single-TIFF files"""
         timepoint_path = self.base_path / str(self.timepoint)
         coords_df = pd.read_csv(timepoint_path / "coordinates.csv")
         tiles = {}
@@ -263,6 +271,88 @@ class PlateAssembler:
                 fov=int(fov),
                 wavelength=wavelength
             )
+        
+        return tiles
+    
+    def _load_tiles_from_ome(self, downsample_factor: float, skip_downsampling: bool, z_level: int = 0) -> Dict:
+        """Load tiles from OME-TIFF files for specific z-level"""
+        # For OME-TIFF, files are in ome_tiff/ directory or fallback to 0/
+        ome_dir = self.base_path / "ome_tiff" if (self.base_path / "ome_tiff").exists() else self.base_path / "0"
+        coords_path = self.base_path / "0" / "coordinates.csv"
+        coords_df = pd.read_csv(coords_path)
+        tiles = {}
+        
+        for ome_file in ome_dir.glob("*.ome.tif*"):
+            if not (m := fpattern_ome.search(ome_file.name)):
+                continue
+            
+            region, fov = m.group("r"), int(m.group("f"))
+            
+            try:
+                with tf.TiffFile(str(ome_file)) as tif:
+                    data = tif.asarray()
+                    
+                    # Parse OME metadata for dimension order
+                    dim_order = 'XYCZT'
+                    if tif.is_ome and tif.ome_metadata:
+                        import xml.etree.ElementTree as ET
+                        root = ET.fromstring(tif.ome_metadata)
+                        ns = {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
+                        pixels = root.find('.//ome:Pixels', ns)
+                        if pixels:
+                            dim_order = pixels.get('DimensionOrder', 'XYCZT')
+                    
+                    # Transpose to (C, Z, T, Y, X) format
+                    if dim_order == 'XYCZT' and len(data.shape) == 5:
+                        # (T, Z, C, Y, X) -> (C, Z, T, Y, X)
+                        data = np.transpose(data, (2, 1, 0, 3, 4))
+                    elif len(data.shape) == 3:
+                        data = data[np.newaxis, :, np.newaxis, :, :]
+                    elif len(data.shape) == 4:
+                        data = data[:, :, np.newaxis, :, :]
+                    elif len(data.shape) != 5:
+                        print(f"Warning: Unexpected shape {data.shape} for {ome_file.name}")
+                        continue
+                    
+                    n_channels, n_z = data.shape[0], data.shape[1]
+                    
+                    # Extract only the requested z-level and timepoint
+                    n_t = data.shape[2]
+                    if z_level >= n_z or self.timepoint >= n_t:
+                        continue  # Skip if requested z/t doesn't exist
+                    
+                    # Find z_level from coordinates
+                    coord_row = coords_df[(coords_df['region'] == region) & 
+                                         (coords_df['fov'] == fov) & 
+                                         (coords_df['z_level'] == z_level)]
+                    if coord_row.empty:
+                        continue
+                    
+                    for c_idx in range(n_channels):
+                        img = data[c_idx, z_level, self.timepoint, :, :]  # Extract specific z and t
+                        # Use indexed channel names for OME files
+                        channel_name = f'Channel_{c_idx}'
+                        
+                        # Downsample if requested
+                        if not skip_downsampling and downsample_factor < 0.98:
+                            target_size = int(min(img.shape[:2]) * downsample_factor)
+                            if target_size < min(img.shape[:2]) - 1:
+                                img = ImageProcessor.downsample_fast(img, target_size)
+                        
+                        tiles[(region, fov, channel_name)] = TileData(
+                            image=img,
+                            x_mm=coord_row['x (mm)'].iloc[0],
+                            y_mm=coord_row['y (mm)'].iloc[0],
+                            file_path=str(ome_file),
+                            region=region,
+                            fov=fov,
+                            wavelength=channel_name
+                        )
+            except Exception as e:
+                print(f"Error processing {ome_file.name}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
         
         return tiles
     
@@ -328,9 +418,20 @@ class PlateAssembler:
                     tile_map['fov_to_files'][key] = {}
                 tile_map['fov_to_files'][key][wl] = tile.file_path
         
+        # Assign colors by ORDER: 1st=blue, 2nd=green, 3rd=yellow, 4th=red, 5th=darkred, 6th+=gray
+        default_colors = ['blue', 'green', 'yellow', 'red', 'darkred']
+        colormaps = []
+        for i, wl in enumerate(wavelengths):
+            # Try wavelength-based first
+            color = self._get_colormap(wl)
+            # If no wavelength match (gray), use order-based
+            if color == 'gray':
+                color = default_colors[i] if i < len(default_colors) else 'gray'
+            colormaps.append(color)
+        
         return {
             'multichannel': canvas,
             'wavelengths': wavelengths,
-            'colormaps': [self._get_colormap(wl) for wl in wavelengths]
+            'colormaps': colormaps
         }, tile_map
 

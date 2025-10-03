@@ -453,12 +453,46 @@ class TiffViewerWidget(QWidget):
         """Create LUT dictionary for NDV viewer based on channel wavelengths"""
         luts = {}
         for i, wavelength in enumerate(self.wavelengths):
-            if '405' in wavelength: luts[i] = 'blue'
-            elif '488' in wavelength: luts[i] = 'green'
-            elif '561' in wavelength: luts[i] = 'yellow'
-            elif '638' in wavelength or '640' in wavelength: luts[i] = 'red'
-            else: luts[i] = 'gray'
+            luts[i] = self._get_channel_colormap_from_name(wavelength, i)
         return luts
+    
+    def _get_channel_colormap_from_name(self, channel_name: str, index: int) -> str:
+        """Get colormap for a channel based on its name or wavelength.
+        
+        Based on wavelength detection:
+        - 405nm -> blue
+        - 488nm -> green  
+        - 561nm -> yellow
+        - 638/640nm -> red
+        - 730nm -> darkred
+        - _B suffix -> blue
+        - _G suffix -> green
+        - _R suffix -> red
+        """
+        name_upper = channel_name.upper()
+        
+        # Check for wavelength numbers
+        if '405' in name_upper:
+            return 'blue'
+        elif '488' in name_upper:
+            return 'green'
+        elif '561' in name_upper:
+            return 'yellow'
+        elif '638' in name_upper or '640' in name_upper:
+            return 'red'
+        elif '730' in name_upper:
+            return 'darkred'
+        # Check for suffix patterns
+        elif name_upper.endswith('_B'):
+            return 'blue'
+        elif name_upper.endswith('_G'):
+            return 'green'
+        elif name_upper.endswith('_R'):
+            return 'red'
+        # Default color based on index
+        else:
+            default_colors = ['blue', 'green', 'yellow', 'red', 'darkred']
+            return default_colors[index] if index < len(default_colors) else 'gray'
 
     def set_ndv_data(self, data):
         """Enhanced version that handles lazy arrays properly"""
@@ -762,8 +796,9 @@ class TiffViewerWidget(QWidget):
             return None
     
     def _create_fov_from_ome(self, target_fov: int, target_region: str = None) -> Optional[xr.DataArray]:
-        """Load FOV from OME-TIFF files (new format)"""
+        """Load FOV from OME-TIFF files using bioio for lazy loading"""
         try:
+            from bioio import BioImage
             base_path = Path(self.base_path)
             
             # OME-TIFF files contain all timepoints internally
@@ -782,96 +817,44 @@ class TiffViewerWidget(QWidget):
                 print(f"No OME-TIFF file found for FOV {target_fov} in region {target_region}")
                 return None
             
-            # Read metadata from the OME file
-            with tf.TiffFile(ome_file) as tif:
-                sample_data = tif.asarray()
-                
-                # Parse OME metadata to understand dimension order
-                dim_order = 'XYCZT'  # Default
-                size_c, size_z, size_t = 1, 1, 1
-                
-                if tif.is_ome and tif.ome_metadata:
-                    import xml.etree.ElementTree as ET
-                    root = ET.fromstring(tif.ome_metadata)
-                    ns = {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
-                    pixels = root.find('.//ome:Pixels', ns)
-                    if pixels:
-                        dim_order = pixels.get('DimensionOrder', 'XYCZT')
-                        size_c = int(pixels.get('SizeC', 1))
-                        size_z = int(pixels.get('SizeZ', 1))
-                        size_t = int(pixels.get('SizeT', 1))
-                
-                # Tifffile returns array based on dimension order
-                # For XYCZT order with shape (T, Z, C, Y, X), we need to transpose to (C, Z, T, Y, X)
-                if dim_order == 'XYCZT' and len(sample_data.shape) == 5:
-                    # Shape is (T, Z, C, Y, X), transpose to (C, Z, T, Y, X)
-                    sample_data = np.transpose(sample_data, (2, 1, 0, 3, 4))
-                elif len(sample_data.shape) == 3:
-                    # (Z, Y, X) - single channel, single T
-                    sample_data = sample_data[np.newaxis, :, np.newaxis, :, :]
-                elif len(sample_data.shape) == 4:
-                    # Could be (C, Z, Y, X) or (Z, C, Y, X) - add T dimension
-                    sample_data = sample_data[:, :, np.newaxis, :, :]
-                
-                n_channels, n_z, n_timepoints, height, width = sample_data.shape
-                
-                # Extract channel names from OME metadata
-                channel_names = []
-                if tif.is_ome and tif.ome_metadata:
-                    import xml.etree.ElementTree as ET
-                    root = ET.fromstring(tif.ome_metadata)
-                    ns = {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
-                    pixels = root.find('.//ome:Pixels', ns)
-                    if pixels:
-                        for ch in pixels.findall('ome:Channel', ns):
-                            channel_names.append(ch.get('Name', ''))
+            # Load with bioio - handles all dimension complexity
+            bio_img = BioImage(ome_file)
+            
+            # Get dimensions
+            n_channels = bio_img.dims.C
+            n_z = bio_img.dims.Z
+            n_timepoints = bio_img.dims.T
+            height = bio_img.dims.Y
+            width = bio_img.dims.X
             
             print(f"Found OME-TIFF for FOV {target_fov}: C={n_channels}, Z={n_z}, T={n_timepoints}")
             
-            # Build colormap LUTs from channel names
-            from .common import COLOR_MAPS
+            # Extract channel names from bioio metadata
+            channel_names = []
+            try:
+                # bioio provides channel names through physical_pixel_sizes or ome metadata
+                if hasattr(bio_img, 'channel_names') and bio_img.channel_names:
+                    channel_names = list(bio_img.channel_names)
+                    print(f"Channel names from bioio: {channel_names}")
+            except Exception as e:
+                print(f"Could not extract channel names: {e}")
+            
+            # Build colormap LUTs from actual channel names
             luts = {}
-            default_colors = ['blue', 'green', 'yellow', 'red', 'darkred']  # Ch0-4, then gray
             
             for i in range(n_channels):
                 name = channel_names[i] if i < len(channel_names) else f'Channel_{i}'
-                colormap = None
-                
-                # Try to extract wavelength from name
-                for wl_key, color in COLOR_MAPS.items():
-                    if wl_key in name:
-                        colormap = color
-                        break
-                
-                # If no wavelength found, use default color palette
-                if colormap is None:
-                    if i < len(default_colors):
-                        colormap = default_colors[i]
-                    else:
-                        colormap = 'gray'  # Ch5+ get gray
-                
+                colormap = self._get_channel_colormap_from_name(name, i)
                 luts[i] = colormap
+                print(f"Channel {i}: '{name}' -> {colormap}")
             
-            # Build lazy dask array structure: (time, z_level, channel, y, x)
-            def load_ome_slice(filepath, c_idx, z_idx, t_idx, dim_order):
+            # Build lazy dask array structure using bioio: (time, z_level, channel, y, x)
+            def load_ome_slice_bioio(filepath, c_idx, z_idx, t_idx):
                 def _load():
                     try:
-                        with tf.TiffFile(filepath) as tif:
-                            data = tif.asarray()
-                            
-                            # Transpose based on dimension order
-                            if dim_order == 'XYCZT' and len(data.shape) == 5:
-                                # (T, Z, C, Y, X) -> (C, Z, T, Y, X)
-                                data = np.transpose(data, (2, 1, 0, 3, 4))
-                            elif len(data.shape) == 3:
-                                # (Z, Y, X) - single channel
-                                data = data[np.newaxis, :, np.newaxis, :, :]
-                            elif len(data.shape) == 4:
-                                # (C, Z, Y, X) or similar - add T dim
-                                data = data[:, :, np.newaxis, :, :]
-                            
-                            # Now data is (C, Z, T, Y, X)
-                            return data[c_idx, z_idx, t_idx, :, :]
+                        bio = BioImage(filepath)
+                        # bioio handles ALL dimension ordering automatically!
+                        return bio.get_image_data("YX", T=t_idx, C=c_idx, Z=z_idx)
                     except Exception as e:
                         print(f"Error loading OME slice: {e}")
                         return np.zeros((height, width), dtype=np.uint16)
@@ -883,7 +866,7 @@ class TiffViewerWidget(QWidget):
                 for z in range(n_z):
                     channel_arrays = []
                     for c in range(n_channels):
-                        delayed_load = delayed(load_ome_slice(ome_file, c, z, t, dim_order))
+                        delayed_load = delayed(load_ome_slice_bioio(ome_file, c, z, t))
                         dask_chunk = da.from_delayed(delayed_load(), shape=(height, width), dtype=np.uint16)
                         channel_arrays.append(dask_chunk)
                     z_arrays.append(da.stack(channel_arrays, axis=0))

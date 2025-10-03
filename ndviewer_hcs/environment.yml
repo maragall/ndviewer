@@ -23,3 +23,5 @@ dependencies:
       - pyconify==0.2.1
       - vispy==0.14.3
       - imagecodecs
+      - bioio
+      - bioio-ome-tiff

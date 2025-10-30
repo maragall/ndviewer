@@ -244,7 +244,6 @@ class StackBuilderThread(QThread):
     def _detect_z_levels(self) -> List[int]:
         """Detect available z-levels from first timepoint"""
         from .common import fpattern, fpattern_ome, detect_acquisition_format
-        import tifffile as tf
         
         # Look in first timepoint directory
         timepoints = self._detect_timepoints()
@@ -258,16 +257,14 @@ class StackBuilderThread(QThread):
         format_type = detect_acquisition_format(self.base_path)
         
         if format_type == 'ome_tiff':
-            # Get z-levels from OME-TIFF metadata
+            # Get z-levels from OME-TIFF metadata using bioio
+            from bioio import BioImage
             ome_dir = self.base_path / "ome_tiff" if (self.base_path / "ome_tiff").exists() else self.base_path / "0"
             for ome_file in ome_dir.glob("*.ome.tif*"):
                 try:
-                    with tf.TiffFile(str(ome_file)) as tif:
-                        data = tif.asarray()
-                        # Handle different shapes
-                        if len(data.shape) >= 2:
-                            n_z = data.shape[1] if len(data.shape) >= 2 else 1
-                            z_levels.update(range(n_z))
+                    bio_img = BioImage(str(ome_file))
+                    n_z = bio_img.dims.Z
+                    z_levels.update(range(n_z))
                     break  # Only need to check one file
                 except:
                     pass

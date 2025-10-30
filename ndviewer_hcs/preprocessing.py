@@ -221,9 +221,41 @@ class PlateAssembler:
         match = re.match(r"([A-Z]+\d+)_(\d+)_(\d+)_.*_(\d+)_nm_Ex\.tiff", filepath.name)
         return match.groups() if match else None
     
-    def _get_colormap(self, wavelength: str) -> str:
-        """Get colormap for wavelength"""
-        return next((color for wl, color in COLOR_MAPS.items() if wl in wavelength), 'gray')
+    def _get_colormap(self, channel_name: str) -> str:
+        """Get colormap for channel based on wavelength or suffix.
+        
+        Mapping:
+        - 405nm -> blue
+        - 488nm -> green
+        - 561nm -> yellow
+        - 638/640nm -> red
+        - 730nm -> darkred
+        - _B suffix -> blue
+        - _G suffix -> green
+        - _R suffix -> red
+        """
+        name_upper = channel_name.upper()
+        
+        # Check for wavelength numbers
+        if '405' in name_upper:
+            return 'blue'
+        elif '488' in name_upper:
+            return 'green'
+        elif '561' in name_upper:
+            return 'yellow'
+        elif '638' in name_upper or '640' in name_upper:
+            return 'red'
+        elif '730' in name_upper:
+            return 'darkred'
+        # Check for suffix patterns
+        elif name_upper.endswith('_B'):
+            return 'blue'
+        elif name_upper.endswith('_G'):
+            return 'green'
+        elif name_upper.endswith('_R'):
+            return 'red'
+        else:
+            return 'gray'
     
     def _load_tiles(self, flatfields: Dict, downsample_factor: float, skip_downsampling: bool, z_level: int = 0) -> Dict:
         """Load tiles with optional flatfield correction and downsampling"""
@@ -275,7 +307,9 @@ class PlateAssembler:
         return tiles
     
     def _load_tiles_from_ome(self, downsample_factor: float, skip_downsampling: bool, z_level: int = 0) -> Dict:
-        """Load tiles from OME-TIFF files for specific z-level"""
+        """Load tiles from OME-TIFF files for specific z-level using bioio"""
+        from bioio import BioImage
+        
         # For OME-TIFF, files are in ome_tiff/ directory or fallback to 0/
         ome_dir = self.base_path / "ome_tiff" if (self.base_path / "ome_tiff").exists() else self.base_path / "0"
         coords_path = self.base_path / "0" / "coordinates.csv"
@@ -289,65 +323,57 @@ class PlateAssembler:
             region, fov = m.group("r"), int(m.group("f"))
             
             try:
-                with tf.TiffFile(str(ome_file)) as tif:
-                    data = tif.asarray()
+                # Load with bioio - no need to worry about dimension order!
+                bio_img = BioImage(str(ome_file))
+                
+                # Get dimensions
+                n_channels = bio_img.dims.C
+                n_z = bio_img.dims.Z
+                n_t = bio_img.dims.T
+                
+                # Extract actual channel names from bioio
+                channel_names = []
+                try:
+                    if hasattr(bio_img, 'channel_names') and bio_img.channel_names:
+                        channel_names = list(bio_img.channel_names)
+                        print(f"Channel names from OME-TIFF: {channel_names}")
+                except:
+                    pass
+                
+                # Check if requested indices are valid
+                if z_level >= n_z or self.timepoint >= n_t:
+                    continue
+                
+                # Find z_level from coordinates
+                coord_row = coords_df[(coords_df['region'] == region) & 
+                                     (coords_df['fov'] == fov) & 
+                                     (coords_df['z_level'] == z_level)]
+                if coord_row.empty:
+                    continue
+                
+                # Extract each channel at the specific z and t
+                for c_idx in range(n_channels):
+                    # bioio handles all dimension ordering automatically!
+                    img = bio_img.get_image_data("YX", T=self.timepoint, C=c_idx, Z=z_level)
                     
-                    # Parse OME metadata for dimension order
-                    dim_order = 'XYCZT'
-                    if tif.is_ome and tif.ome_metadata:
-                        import xml.etree.ElementTree as ET
-                        root = ET.fromstring(tif.ome_metadata)
-                        ns = {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
-                        pixels = root.find('.//ome:Pixels', ns)
-                        if pixels:
-                            dim_order = pixels.get('DimensionOrder', 'XYCZT')
+                    # Use actual channel names from OME metadata if available
+                    channel_name = channel_names[c_idx] if c_idx < len(channel_names) else f'Channel_{c_idx}'
                     
-                    # Transpose to (C, Z, T, Y, X) format
-                    if dim_order == 'XYCZT' and len(data.shape) == 5:
-                        # (T, Z, C, Y, X) -> (C, Z, T, Y, X)
-                        data = np.transpose(data, (2, 1, 0, 3, 4))
-                    elif len(data.shape) == 3:
-                        data = data[np.newaxis, :, np.newaxis, :, :]
-                    elif len(data.shape) == 4:
-                        data = data[:, :, np.newaxis, :, :]
-                    elif len(data.shape) != 5:
-                        print(f"Warning: Unexpected shape {data.shape} for {ome_file.name}")
-                        continue
+                    # Downsample if requested
+                    if not skip_downsampling and downsample_factor < 0.98:
+                        target_size = int(min(img.shape[:2]) * downsample_factor)
+                        if target_size < min(img.shape[:2]) - 1:
+                            img = ImageProcessor.downsample_fast(img, target_size)
                     
-                    n_channels, n_z = data.shape[0], data.shape[1]
-                    
-                    # Extract only the requested z-level and timepoint
-                    n_t = data.shape[2]
-                    if z_level >= n_z or self.timepoint >= n_t:
-                        continue  # Skip if requested z/t doesn't exist
-                    
-                    # Find z_level from coordinates
-                    coord_row = coords_df[(coords_df['region'] == region) & 
-                                         (coords_df['fov'] == fov) & 
-                                         (coords_df['z_level'] == z_level)]
-                    if coord_row.empty:
-                        continue
-                    
-                    for c_idx in range(n_channels):
-                        img = data[c_idx, z_level, self.timepoint, :, :]  # Extract specific z and t
-                        # Use indexed channel names for OME files
-                        channel_name = f'Channel_{c_idx}'
-                        
-                        # Downsample if requested
-                        if not skip_downsampling and downsample_factor < 0.98:
-                            target_size = int(min(img.shape[:2]) * downsample_factor)
-                            if target_size < min(img.shape[:2]) - 1:
-                                img = ImageProcessor.downsample_fast(img, target_size)
-                        
-                        tiles[(region, fov, channel_name)] = TileData(
-                            image=img,
-                            x_mm=coord_row['x (mm)'].iloc[0],
-                            y_mm=coord_row['y (mm)'].iloc[0],
-                            file_path=str(ome_file),
-                            region=region,
-                            fov=fov,
-                            wavelength=channel_name
-                        )
+                    tiles[(region, fov, channel_name)] = TileData(
+                        image=img,
+                        x_mm=coord_row['x (mm)'].iloc[0],
+                        y_mm=coord_row['y (mm)'].iloc[0],
+                        file_path=str(ome_file),
+                        region=region,
+                        fov=fov,
+                        wavelength=channel_name
+                    )
             except Exception as e:
                 print(f"Error processing {ome_file.name}: {e}")
                 import traceback

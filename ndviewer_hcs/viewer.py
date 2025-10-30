@@ -196,8 +196,7 @@ class TiffViewerWidget(QWidget):
         rgb_image = np.zeros((height, width, 3), dtype=np.float32)
         
         for i, (channel, colormap) in enumerate(zip(self.multichannel_image, self.colormaps)):
-            # Keep in uint16 space, apply contrast limits
-            # Try to get contrast limits - check cache first, then read from NDV
+            # Try to get contrast limits from NDV first
             if i not in self._plate_contrast_limits and hasattr(self, 'ndv_viewer'):
                 try:
                     lut = self.ndv_viewer.display_model.luts.get(i)
@@ -209,32 +208,29 @@ class TiffViewerWidget(QWidget):
                 except:
                     pass
             
+            # Apply contrast limits
             if i in self._plate_contrast_limits:
                 vmin, vmax = self._plate_contrast_limits[i]
-                # Clip to contrast limits (uint16 range)
-                clipped = np.clip(channel.astype(np.float32), vmin, vmax)
-                # Normalize to [0, 1] in 16-bit space
-                if vmax > vmin:
-                    normalized_float = (clipped - vmin) / (vmax - vmin)
-                else:
-                    normalized_float = np.zeros_like(clipped, dtype=np.float32)
             else:
-                # Auto-contrast in uint16 space
-                if channel.dtype == np.uint16:
-                    p2, p98 = np.percentile(channel, (2, 98))
-                    if p98 > p2:
-                        normalized_float = np.clip((channel.astype(np.float32) - p2) / (p98 - p2), 0, 1)
-                    else:
-                        normalized_float = channel.astype(np.float32) / 65535.0
+                # Fallback: Use wider percentile range for downsampled data
+                nonzero = channel[channel > 0]
+                if len(nonzero) > 0:
+                    vmin, vmax = np.percentile(nonzero, (0.5, 99.5))
                 else:
-                    normalized_float = channel.astype(np.float32) / 255.0
+                    vmin, vmax = 0, 65535 if channel.dtype == np.uint16 else 255
             
-            # Apply color weights - NDV uses additive blending
+            # Normalize to [0, 1]
+            if vmax > vmin:
+                normalized = np.clip((channel.astype(np.float32) - vmin) / (vmax - vmin), 0, 1)
+            else:
+                normalized = np.zeros_like(channel, dtype=np.float32)
+            
+            # Additive blending (physically correct for fluorescence)
             weights = COLOR_WEIGHTS.get(colormap, [0.5, 0.5, 0.5])
             for c in range(3):
-                rgb_image[:, :, c] += normalized_float * weights[c]
+                rgb_image[:, :, c] += normalized * weights[c]
         
-        # Clip and convert to uint8 for display
+        # Clip and convert to uint8
         return (np.clip(rgb_image, 0, 1) * 255).astype(np.uint8)
 
     def _normalize_channel_with_limits_uint16(self, channel: np.ndarray, vmin: float, vmax: float) -> np.ndarray:

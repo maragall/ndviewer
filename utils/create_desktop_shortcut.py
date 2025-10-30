@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-create_desktop_shortcut.py – generate Desktop launchers for NDViewer
+create_desktop_shortcut.py – generate Desktop launchers for NDViewer HCS
 on Ubuntu (XDG-compliant) and Windows that activate the conda environment.
 
 Run from the project root:
-    python3 create_desktop_shortcut.py
+    python3 utils/create_desktop_shortcut.py
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ def check_environment(env_name: str = "ndv") -> bool:
 
 def find_icon(project_root: Path) -> Path:
     """Return the icon PNG in project root or create a simple one."""
-    icon_path = project_root / "ndviewer_icon.png"
+    icon_path = project_root / "ndviewer_hcs_icon.png"
     
     # If icon doesn't exist, create a simple one
     if not icon_path.exists():
@@ -61,7 +61,7 @@ def find_icon(project_root: Path) -> Path:
             draw = ImageDraw.Draw(img)
             
             # Try to load a clean, modern font
-            font_size = 160
+            font_size = 120
             font = None
             for font_name in ["Arial-Bold", "DejaVuSans-Bold", "LiberationSans-Bold", "arial.ttf"]:
                 try:
@@ -73,7 +73,7 @@ def find_icon(project_root: Path) -> Path:
             if font is None:
                 font = ImageFont.load_default()
             
-            text = "ND"
+            text = "HCS"
             bbox = draw.textbbox((0, 0), text, font=font)
             text_width = bbox[2] - bbox[0]
             text_height = bbox[3] - bbox[1]
@@ -107,27 +107,26 @@ def windows_shortcuts(project_root: Path, icon_png: Path, desktop: Path, conda_b
     if icon_png.exists():
         try:
             from PIL import Image
-            ico_path = project_root / "ndviewer_icon.ico"
+            ico_path = project_root / "ndviewer_hcs_icon.ico"
             img = Image.open(icon_png)
             img.save(ico_path, format='ICO', sizes=[(256, 256)])
         except ImportError:
             print("[WARNING] PIL not available, using PNG icon")
     
-    # Create batch file for napari viewer
-    script_name = "ndviewer_napari.py"
-    shortcut_name = "NDViewer Napari"
+    # Create batch file for HCS viewer
+    shortcut_name = "NDViewer HCS"
     
-    if not (project_root / script_name).exists():
-        print(f"[WARNING] {script_name} not found, skipping...")
+    if not (project_root / "ndviewer_hcs" / "ndviewer_hcs.py").exists():
+        print(f"[WARNING] ndviewer_hcs/ndviewer_hcs.py not found, skipping...")
         return
             
     # Create batch file with conda activation
-    bat_path = project_root / f"start_{script_name.replace('.py', '')}.bat"
+    bat_path = project_root / "start_ndviewer_hcs.bat"
     bat_content = (
         "@echo off\r\n"
         f"call \"{conda_base}\\Scripts\\activate.bat\" ndv\r\n"
         f"cd /d \"{project_root}\"\r\n"
-        f"python {script_name}\r\n"
+        "python -m ndviewer_hcs.ndviewer_hcs\r\n"
         "pause\r\n"
     )
     bat_path.write_text(bat_content, encoding="utf-8")
@@ -158,19 +157,18 @@ def windows_shortcuts(project_root: Path, icon_png: Path, desktop: Path, conda_b
 def ubuntu_shortcuts(project_root: Path, icon_png: Path, desktop: Path, conda_base: Path) -> None:
     """Create XDG .desktop launchers on Ubuntu/Linux with conda activation."""
     
-    # Create wrapper script and desktop file for napari viewer
-    script_name = "ndviewer_napari.py"
-    app_name = "NDViewer Napari"
-    comment = "ND viewer with napari backend"
+    # Create wrapper script and desktop file for HCS viewer
+    app_name = "NDViewer HCS"
+    comment = "High-Content Screening Viewer"
     
-    if not (project_root / script_name).exists():
-        print(f"[WARNING] {script_name} not found, skipping...")
+    if not (project_root / "ndviewer_hcs" / "ndviewer_hcs.py").exists():
+        print(f"[WARNING] ndviewer_hcs/ndviewer_hcs.py not found, skipping...")
         return
             
     # Create wrapper script
-    wrapper_path = project_root / f"launch_{script_name.replace('.py', '')}.sh"
+    wrapper_path = project_root / "launch_ndviewer_hcs.sh"
     wrapper_content = f"""#!/bin/bash
-# Activate conda environment and launch {script_name}
+# Activate conda environment and launch NDViewer HCS
 
 # Source conda
 if [ -f "{conda_base}/etc/profile.d/conda.sh" ]; then
@@ -185,14 +183,14 @@ conda activate ndv
 # Change to project directory
 cd "{project_root}"
 
-# Launch the viewer
-python {script_name}
+# Launch the HCS viewer
+python -m ndviewer_hcs.ndviewer_hcs
 """
     wrapper_path.write_text(wrapper_content)
     wrapper_path.chmod(0o755)
     
     # Create desktop file
-    desktop_file = desktop / f"{script_name.replace('.py', '')}.desktop"
+    desktop_file = desktop / "ndviewer_hcs.desktop"
     
     desktop_content = "\n".join([
         "[Desktop Entry]",
@@ -215,7 +213,7 @@ python {script_name}
 # ─────────────────────────────── main ───────────────────────────────────
 
 def main() -> None:
-    project_root = Path(__file__).resolve().parent
+    project_root = Path(__file__).resolve().parent.parent
     
     # Find conda
     print("Detecting conda installation...")
@@ -226,7 +224,7 @@ def main() -> None:
     if not check_environment("ndv"):
         print("\n[WARNING] 'ndv' conda environment not found!")
         print("Please run the setup script first:")
-        print("  python setup_environment.py")
+        print("  ./setup.sh")
         sys.exit(1)
     else:
         print("[OK] Found 'ndv' conda environment")
@@ -238,7 +236,7 @@ def main() -> None:
     
     os_name = platform.system().lower()
     
-    print(f"\nCreating desktop shortcuts for NDViewer...")
+    print(f"\nCreating desktop shortcuts for NDViewer HCS...")
     print(f"Project root: {project_root}")
     print(f"Desktop: {desktop}")
     

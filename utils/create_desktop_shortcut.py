@@ -39,7 +39,7 @@ def find_conda() -> tuple[Path, str]:
     
     return conda_base, cmd
 
-def check_environment(env_name: str = "ndv") -> bool:
+def check_environment(env_name: str = "ndv_HCS") -> bool:
     """Check if the ndv environment exists."""
     result = subprocess.run(['conda', 'env', 'list'], 
                           capture_output=True, text=True)
@@ -124,7 +124,7 @@ def windows_shortcuts(project_root: Path, icon_png: Path, desktop: Path, conda_b
     bat_path = project_root / "start_ndviewer_hcs.bat"
     bat_content = (
         "@echo off\r\n"
-        f"call \"{conda_base}\\Scripts\\activate.bat\" ndv\r\n"
+        f"call \"{conda_base}\\Scripts\\activate.bat\" ndv_HCS\r\n"
         f"cd /d \"{project_root}\"\r\n"
         "python -m ndviewer_hcs.ndviewer_hcs\r\n"
         "pause\r\n"
@@ -178,7 +178,7 @@ else
 fi
 
 # Activate environment
-conda activate ndv
+conda activate ndv_HCS
 
 # Change to project directory
 cd "{project_root}"
@@ -221,13 +221,13 @@ def main() -> None:
     print(f"[OK] Found {conda_cmd} at: {conda_base}")
     
     # Check if ndv environment exists
-    if not check_environment("ndv"):
-        print("\n[WARNING] 'ndv' conda environment not found!")
+    if not check_environment("ndv_HCS"):
+        print("\n[WARNING] 'ndv_HCS' conda environment not found!")
         print("Please run the setup script first:")
         print("  ./setup.sh")
         sys.exit(1)
     else:
-        print("[OK] Found 'ndv' conda environment")
+        print("[OK] Found 'ndv_HCS' conda environment")
     
     icon_png = find_icon(project_root)
     
@@ -248,7 +248,7 @@ def main() -> None:
         sys.exit("[ERROR] Unsupported OS: only Windows and Ubuntu are handled.")
     
     print("\n[SUCCESS] Desktop shortcuts created!")
-    print("The shortcuts will automatically activate the 'ndv' conda environment.")
+    print("The shortcuts will automatically activate the 'ndv_HCS' conda environment.")
 
 if __name__ == "__main__":
     main()

@@ -87,6 +87,135 @@ def detect_acquisition_format(base_path: Path) -> str:
         return 'ome_tiff' if has_ome else 'single_tiff'
     return 'single_tiff'
 
+def extract_region_name_from_path(file_path: Path) -> str:
+    """
+    Extract region name from file/directory path using common patterns.
+    
+    Args:
+        file_path: Path to file or directory
+        
+    Returns:
+        Extracted region name (e.g., 'A1', 'B12', etc.)
+    """
+    if isinstance(file_path, str):
+        file_path = Path(file_path)
+    
+    name = file_path.stem  # Get filename without extension
+    
+    # Remove common suffixes to get clean region name
+    suffixes_to_remove = ['_stitched', '_processed', '_merged', '.ome']
+    for suffix in suffixes_to_remove:
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+    
+    # Handle common patterns:
+    # Pattern 1: "A1_0.ome.tif" -> "A1" (region_fov format)
+    match = re.match(r'^([A-Z]\d+)_\d+', name)
+    if match:
+        return match.group(1)
+    
+    # Pattern 2: Direct region name "A1", "B12", etc.
+    match = re.match(r'^([A-Z]+\d+)$', name)
+    if match:
+        return match.group(1)
+    
+    # Pattern 3: Longer names with region "RegionA1_something" -> "A1"
+    match = re.search(r'([A-Z]+\d+)', name)
+    if match:
+        return match.group(1)
+    
+    # Return the cleaned name if no specific pattern matches
+    return name
+
+def detect_hcs_vs_normal_tissue(dataset_directory_path: Path) -> bool:
+    """
+    Detect whether a dataset is HCS (wellplate) or normal tissue based on:
+    1. Timepoint directory structure patterns
+    2. Region naming conventions (wellplate patterns)
+    3. Multiple timepoint/region analysis
+    
+    Works with any file format (OME-TIFF, TIFF, etc.)
+    
+    Args:
+        dataset_directory_path: Path to the dataset directory
+        
+    Returns:
+        True if HCS/wellplate dataset, False if normal tissue
+    """
+    if isinstance(dataset_directory_path, str):
+        dataset_directory_path = Path(dataset_directory_path)
+    
+    # STEP 1: Extract dataset directory from output path
+    dataset_dir = dataset_directory_path
+    
+    # Navigate to dataset root if currently in a subdirectory
+    if dataset_dir.name.endswith("_stitched") or dataset_dir.name.isdigit():
+        dataset_dir = dataset_dir.parent
+    
+    if not dataset_dir.exists():
+        print(f"Warning: Dataset directory does not exist: {dataset_dir}")
+        return False
+    
+    # STEP 2: Find timepoint directories with strict pattern matching
+    timepoint_dirs = []
+    for item in dataset_dir.iterdir():
+        if (item.is_dir() and 
+            re.match(r'^\d+(_stitched)?$', item.name)):  # Match "0", "1" or "0_stitched", "1_stitched"
+            timepoint_dirs.append(item)
+    
+    if not timepoint_dirs:
+        print(f"No timepoint directories found in {dataset_dir}")
+        return False  # No timepoint directories = not HCS
+    
+    # STEP 3: Analyze files and region naming patterns
+    total_image_files = 0
+    wellplate_regions = set()
+    
+    for timepoint_dir in timepoint_dirs:
+        # Look for image files (OME-TIFF, TIFF, etc.)
+        image_files = []
+        for item in timepoint_dir.iterdir():
+            if item.is_file() and item.suffix.lower() in ['.tiff', '.tif', '.ome.tiff', '.ome.tif']:
+                image_files.append(item)
+            elif item.is_dir():  # Could be other directory-based formats
+                image_files.append(item)
+        
+        total_image_files += len(image_files)
+        
+        # STEP 4: Extract and analyze region names for wellplate patterns
+        for image_file in image_files:
+            region_name = extract_region_name_from_path(image_file)
+            
+            if not region_name or region_name.startswith("._"):
+                continue
+            
+            # KEY PATTERN: Check for wellplate naming (letter(s) + number(s))
+            # Examples: A1, B2, C12, AA1, AB24, etc.
+            wellplate_match = re.match(r'^([A-Z]+)(\d+)$', region_name)
+            if wellplate_match:
+                wellplate_regions.add(region_name)
+    
+    if total_image_files == 0:
+        print(f"No image files found in timepoint directories")
+        return False  # No image files = not HCS
+    
+    # STEP 5: Final HCS determination logic
+    # HCS dataset if ANY of these conditions are met:
+    is_hcs = (
+        len(timepoint_dirs) > 1 or                    # Multiple timepoints
+        len(wellplate_regions) > 1 or                 # Multiple wellplate regions  
+        (len(timepoint_dirs) == 1 and total_image_files > 1)  # Single timepoint, multiple files
+    )
+    
+    # Log detection results
+    print(f"[HCS Detection] Dataset: {dataset_dir.name}")
+    print(f"  - Timepoint directories: {len(timepoint_dirs)}")
+    print(f"  - Total image files: {total_image_files}")
+    print(f"  - Wellplate regions detected: {len(wellplate_regions)} {list(wellplate_regions)[:5]}")
+    print(f"  - Result: {'HCS/Wellplate' if is_hcs else 'Normal Tissue'}")
+    
+    return is_hcs
+
 class ImageProcessor:
     @staticmethod
     def downsample_fast(img: np.ndarray, target_size: int) -> np.ndarray:

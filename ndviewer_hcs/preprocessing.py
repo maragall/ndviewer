@@ -322,6 +322,7 @@ class PlateAssembler:
             
             region, fov = m.group("r"), int(m.group("f"))
             
+            bio_img = None
             try:
                 # Load with bioio - no need to worry about dimension order!
                 bio_img = BioImage(str(ome_file))
@@ -336,12 +337,12 @@ class PlateAssembler:
                 try:
                     if hasattr(bio_img, 'channel_names') and bio_img.channel_names:
                         channel_names = list(bio_img.channel_names)
-                        print(f"Channel names from OME-TIFF: {channel_names}")
                 except:
                     pass
                 
                 # Check if requested indices are valid
                 if z_level >= n_z or self.timepoint >= n_t:
+                    del bio_img
                     continue
                 
                 # Find z_level from coordinates
@@ -349,6 +350,7 @@ class PlateAssembler:
                                      (coords_df['fov'] == fov) & 
                                      (coords_df['z_level'] == z_level)]
                 if coord_row.empty:
+                    del bio_img
                     continue
                 
                 # Extract each channel at the specific z and t
@@ -374,6 +376,10 @@ class PlateAssembler:
                         fov=fov,
                         wavelength=channel_name
                     )
+                
+                # Release reference after extracting all channels
+                del bio_img
+                
             except Exception as e:
                 print(f"Error processing {ome_file.name}: {e}")
                 import traceback

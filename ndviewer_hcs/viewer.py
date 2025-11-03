@@ -3,7 +3,7 @@
 import pickle
 import re
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 import numpy as np
 from skimage import io
@@ -12,7 +12,8 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QLabel, QSplitter,
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen
 from PyQt5.QtCore import Qt, pyqtSignal
 
-from .common import COLOR_WEIGHTS, parse_filenames, fpattern, fpattern_ome, detect_acquisition_format
+from .common import (COLOR_WEIGHTS, parse_filenames, fpattern, fpattern_ome, 
+                     detect_acquisition_format, detect_hcs_vs_normal_tissue)
 from .plate_stack import PlateStackManager, StackBuilderThread, NDVSyncController, NDVContrastSyncController
 
 # NDV and zarr imports
@@ -55,40 +56,64 @@ class TiffViewerWidget(QWidget):
         # Use consistent cache directory - in downsampled_image folder
         self.cache_dir = Path(base_path) / "downsampled_image" / "assembled_tiles_cache"
         
-        # Initialize plate stack manager
-        self.plate_stack = PlateStackManager(base_path, self.cache_dir)
-        self.ndv_sync = None  # Will be initialized after NDV viewer is created
-        self.ndv_contrast_sync = None  # Contrast sync controller
+        # Detect dataset type: HCS/wellplate vs normal tissue
+        self.is_hcs_dataset = detect_hcs_vs_normal_tissue(Path(base_path))
+        print(f"\n{'='*60}")
+        print(f"Dataset Type: {'HCS/Wellplate' if self.is_hcs_dataset else 'Normal Tissue'}")
+        print(f"Plate View: {'ENABLED' if self.is_hcs_dataset else 'DISABLED'}")
+        print(f"{'='*60}\n")
+        
+        # Initialize plate-related attributes (only used for HCS datasets)
+        self.plate_stack = None
+        self.ndv_sync = None
+        self.ndv_contrast_sync = None
         self.stack_loaded = False
-        self._plate_contrast_limits = {}  # {channel_idx: (vmin, vmax)}
-        
-        # Load data from cache
-        from .preprocessing import PlateAssembler
-        assembler = PlateAssembler(base_path, timepoint)
-        target_px = int(assembler._get_original_pixel_size() * downsample_factor)
-        self.assembled_data, self.tile_map = assembler.assemble_plate(target_px)
-        
-        if not self.assembled_data or 'multichannel' not in self.assembled_data:
-            print("No images found!")
-            return
-        
-        self.multichannel_image = self.assembled_data['multichannel']
-        self.wavelengths = self.assembled_data['wavelengths']
-        self.colormaps = self.assembled_data['colormaps']
+        self._plate_contrast_limits = {}
+        self.assembled_data = None
+        self.tile_map = None
+        self.multichannel_image = None
+        self.wavelengths = None
+        self.colormaps = None
         self.clicked_position = None
         
-        self._setup_tile_grid()
-        self.setup_ui()
-        self.update_image()
-        
-        # Check if Z×T stack exists, if not build it silently in background
-        if not self.plate_stack.exists(downsample_factor):
-            print("Z×T stack not found, building in background...")
-            self._build_stack_async()
+        # Only assemble plate view for HCS datasets
+        if self.is_hcs_dataset:
+            # Initialize plate stack manager
+            self.plate_stack = PlateStackManager(base_path, self.cache_dir)
+            
+            # Load data from cache
+            from .preprocessing import PlateAssembler
+            assembler = PlateAssembler(base_path, timepoint)
+            target_px = int(assembler._get_original_pixel_size() * downsample_factor)
+            self.assembled_data, self.tile_map = assembler.assemble_plate(target_px)
+            
+            if not self.assembled_data or 'multichannel' not in self.assembled_data:
+                print("No images found!")
+                return
+            
+            self.multichannel_image = self.assembled_data['multichannel']
+            self.wavelengths = self.assembled_data['wavelengths']
+            self.colormaps = self.assembled_data['colormaps']
+            
+            self._setup_tile_grid()
+            self.setup_ui()
+            self.update_image()
+            
+            # Check if Z×T stack exists, if not build it silently in background
+            if not self.plate_stack.exists(downsample_factor):
+                print("Z×T stack not found, building in background...")
+                self._build_stack_async()
+            else:
+                self._load_stack()
         else:
-            self._load_stack()
+            # Normal tissue: Skip plate assembly, show NDV only
+            print("Normal tissue dataset detected - showing FOV viewer only (no plate view)")
+            self.setup_ui_simple()
+            # Optionally load first FOV automatically
+            self._load_first_fov()
 
     def setup_ui(self):
+        """Setup UI for HCS datasets with plate view on left, NDV on right"""
         main_layout = QVBoxLayout()
         splitter = QSplitter(Qt.Horizontal)
         
@@ -131,6 +156,58 @@ class TiffViewerWidget(QWidget):
         splitter.setSizes([600, 400])
         main_layout.addWidget(splitter)
         self.setLayout(main_layout)
+    
+    def setup_ui_simple(self):
+        """Setup simple UI for normal tissue datasets (NDV viewer only)"""
+        main_layout = QVBoxLayout()
+        
+        # Status label at top
+        self.status_label = QLabel("Normal Tissue Dataset - FOV Viewer Mode")
+        self.status_label.setStyleSheet("QLabel { padding: 10px; background-color: #2a2a2a; color: white; }")
+        main_layout.addWidget(self.status_label)
+        
+        # NDV viewer takes full space
+        if NDV_AVAILABLE:
+            dummy_data = np.zeros((4, 100, 100), dtype=np.uint16)
+            self.ndv_viewer = ndv.ArrayViewer(dummy_data, channel_axis=0, channel_mode="composite", visible_axes=(-2, -1))
+            main_layout.addWidget(self.ndv_viewer.widget())
+        else:
+            placeholder = QLabel("NDV not available.\nInstall with: pip install ndv[vispy,pyqt]")
+            placeholder.setAlignment(Qt.AlignCenter)
+            placeholder.setStyleSheet("background-color: #f0f0f0; border: 1px solid #ccc;")
+            main_layout.addWidget(placeholder)
+        
+        self.setLayout(main_layout)
+    
+    def _load_first_fov(self):
+        """Load ALL FOVs for normal tissue datasets to enable FOV slider navigation"""
+        if not NDV_AVAILABLE:
+            return
+        
+        try:
+            self.status_label.setText("Loading all FOVs for navigation...")
+            
+            # Load all FOVs into a multi-FOV xarray
+            all_fovs_array = self.create_all_fovs_zarr_array()
+            
+            if all_fovs_array is not None:
+                self.set_ndv_data(all_fovs_array)
+                
+                # Get FOV count from array
+                fov_dim_idx = all_fovs_array.dims.index('fov') if 'fov' in all_fovs_array.dims else None
+                if fov_dim_idx is not None:
+                    n_fovs = all_fovs_array.shape[fov_dim_idx]
+                    self.status_label.setText(f"Loaded {n_fovs} FOVs - Use FOV slider to navigate")
+                else:
+                    self.status_label.setText("Dataset loaded - Use sliders to navigate")
+            else:
+                self.status_label.setText("Failed to load dataset")
+                
+        except Exception as e:
+            print(f"Error loading FOVs: {e}")
+            import traceback
+            traceback.print_exc()
+            self.status_label.setText("Error loading dataset")
     
     def _setup_tile_grid(self):
         """Setup tile grid information, FOV boundaries, and well boundaries"""
@@ -192,11 +269,16 @@ class TiffViewerWidget(QWidget):
         self.fov_to_files = self.tile_map['fov_to_files']
 
     def _create_color_image(self) -> np.ndarray:
+        """Create RGB composite image from multichannel data (HCS only)"""
+        if self.multichannel_image is None:
+            return np.zeros((100, 100, 3), dtype=np.uint8)
+        
         channels, height, width = self.multichannel_image.shape
         rgb_image = np.zeros((height, width, 3), dtype=np.float32)
         
         for i, (channel, colormap) in enumerate(zip(self.multichannel_image, self.colormaps)):
-            # Try to get contrast limits from NDV first
+            # Keep in uint16 space, apply contrast limits
+            # Try to get contrast limits - check cache first, then read from NDV
             if i not in self._plate_contrast_limits and hasattr(self, 'ndv_viewer'):
                 try:
                     lut = self.ndv_viewer.display_model.luts.get(i)
@@ -208,29 +290,32 @@ class TiffViewerWidget(QWidget):
                 except:
                     pass
             
-            # Apply contrast limits
             if i in self._plate_contrast_limits:
                 vmin, vmax = self._plate_contrast_limits[i]
-            else:
-                # Fallback: Use wider percentile range for downsampled data
-                nonzero = channel[channel > 0]
-                if len(nonzero) > 0:
-                    vmin, vmax = np.percentile(nonzero, (0.5, 99.5))
+                # Clip to contrast limits (uint16 range)
+                clipped = np.clip(channel.astype(np.float32), vmin, vmax)
+                # Normalize to [0, 1] in 16-bit space
+                if vmax > vmin:
+                    normalized_float = (clipped - vmin) / (vmax - vmin)
                 else:
-                    vmin, vmax = 0, 65535 if channel.dtype == np.uint16 else 255
-            
-            # Normalize to [0, 1]
-            if vmax > vmin:
-                normalized = np.clip((channel.astype(np.float32) - vmin) / (vmax - vmin), 0, 1)
+                    normalized_float = np.zeros_like(clipped, dtype=np.float32)
             else:
-                normalized = np.zeros_like(channel, dtype=np.float32)
+                # Auto-contrast in uint16 space
+                if channel.dtype == np.uint16:
+                    p2, p98 = np.percentile(channel, (2, 98))
+                    if p98 > p2:
+                        normalized_float = np.clip((channel.astype(np.float32) - p2) / (p98 - p2), 0, 1)
+                    else:
+                        normalized_float = channel.astype(np.float32) / 65535.0
+                else:
+                    normalized_float = channel.astype(np.float32) / 255.0
             
-            # Additive blending (physically correct for fluorescence)
+            # Apply color weights - NDV uses additive blending
             weights = COLOR_WEIGHTS.get(colormap, [0.5, 0.5, 0.5])
             for c in range(3):
-                rgb_image[:, :, c] += normalized * weights[c]
+                rgb_image[:, :, c] += normalized_float * weights[c]
         
-        # Clip and convert to uint8
+        # Clip and convert to uint8 for display
         return (np.clip(rgb_image, 0, 1) * 255).astype(np.uint8)
 
     def _normalize_channel_with_limits_uint16(self, channel: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
@@ -268,6 +353,10 @@ class TiffViewerWidget(QWidget):
             return channel.astype(np.uint8)
 
     def update_image(self):
+        """Update plate image display (HCS only)"""
+        if not self.is_hcs_dataset or self.multichannel_image is None:
+            return
+        
         display_image = self._create_color_image()
         height, width, channel = display_image.shape
         bytes_per_line = 3 * width
@@ -285,7 +374,10 @@ class TiffViewerWidget(QWidget):
         self.scale_y = self.multichannel_image.shape[1] / scaled_pixmap.height()
 
     def on_image_click(self, x, y):
-        """Handle click on plate image - find FOV and center red dot"""
+        """Handle click on plate image - find FOV and center red dot (HCS only)"""
+        if not self.is_hcs_dataset:
+            return
+        
         pixmap = self.image_label.pixmap()
         if not pixmap:
             self.status_label.setText("No image loaded")
@@ -507,7 +599,6 @@ class TiffViewerWidget(QWidget):
                     except ValueError:
                         pass
                 
-                print(f"Setting data with shape: {data.shape}, channel_axis: {channel_axis}, LUTs: {luts}")
                 
                 current_state = self._capture_viewer_state()
                 
@@ -602,21 +693,30 @@ class TiffViewerWidget(QWidget):
             if channel_axis is not None and channel_axis < len(data.dims):
                 channel_dim_name = data.dims[channel_axis]
                 slider_dims = [d for d in slider_dims if d != channel_dim_name]
-            print(f"Data dimensions: {data.dims}, visible_axes: {visible_axes}")
-            print(f"Dimensions that will have sliders: {slider_dims}")
         
         if channel_axis is not None:
             self.ndv_viewer = ndv.ArrayViewer(data, channel_axis=channel_axis, 
                                              channel_mode="composite", luts=luts,
                                              visible_axes=visible_axes)
         
-        splitter = self.parent().findChild(QSplitter)
-        if splitter:
-            splitter.addWidget(self.ndv_viewer.widget())
-            splitter.setSizes([600, 400])
+        # Add viewer back to UI - handle both HCS and normal tissue layouts
+        if self.is_hcs_dataset:
+            # HCS mode: viewer in right panel of splitter
+            parent = self.parent()
+            if parent:
+                splitter = parent.findChild(QSplitter)
+                if splitter:
+                    splitter.addWidget(self.ndv_viewer.widget())
+                    splitter.setSizes([600, 400])
+        else:
+            # Normal tissue mode: viewer takes full layout (after status label)
+            layout = self.layout()
+            if layout and layout.count() >= 1:
+                # Insert viewer after status label (which should be at index 0)
+                layout.insertWidget(1, self.ndv_viewer.widget())
         
-        # Initialize NDV sync after viewer is created (if stack is loaded)
-        if self.stack_loaded and self.ndv_sync is None:
+        # Initialize NDV sync after viewer is created (if stack is loaded and HCS mode)
+        if self.is_hcs_dataset and self.stack_loaded and self.ndv_sync is None:
             self._init_ndv_sync()
     
     def _ensure_composite_mode_and_luts(self, luts):
@@ -640,8 +740,317 @@ class TiffViewerWidget(QWidget):
         except Exception as e:
             print(f"Error ensuring composite mode and LUTs: {e}")
 
+    def create_all_fovs_zarr_array(self) -> Optional[xr.DataArray]:
+        """
+        Create a xarray DataArray for ALL FOVs.
+        Builds a single unified dask graph - NO files opened during construction.
+        
+        Returns xarray with dimensions: (time, fov, z_level, channel, y, x)
+        """
+        if not ZARR_AVAILABLE:
+            print("Zarr/tifffile/xarray not available")
+            return None
+        
+        try:
+            from bioio import BioImage
+            base_path = Path(self.base_path)
+            format_type = detect_acquisition_format(base_path)
+            
+            # Discover all available FOVs (just filenames - no opening!)
+            all_fovs = self._discover_all_fovs()
+            
+            if not all_fovs:
+                print("No FOVs found in dataset")
+                return None
+            
+            
+            if format_type == 'ome_tiff':
+                return self._create_unified_ome_lazy_array(all_fovs)
+            else:
+                return self._create_unified_single_tiff_lazy_array(all_fovs)
+            
+        except Exception as e:
+            print(f"Error creating multi-FOV array: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _create_unified_ome_lazy_array(self, all_fovs: List[Dict]) -> Optional[xr.DataArray]:
+        """
+        Create unified lazy array for OME-TIFF - opens ONE file to get dimensions,
+        then builds lazy graph for all FOVs.
+        """
+        try:
+            from bioio import BioImage
+            base_path = Path(self.base_path)
+            
+            # Build file index: {(region, fov): filepath}
+            ome_dir = base_path / "ome_tiff" if (base_path / "ome_tiff").exists() else base_path / "0"
+            file_index = {}
+            for fov_info in all_fovs:
+                region = fov_info['region']
+                fov = fov_info['fov']
+                # Find the file
+                for ome_path in ome_dir.glob("*.ome.tif*"):
+                    if m := fpattern_ome.search(ome_path.name):
+                        if m.group("r") == region and int(m.group("f")) == fov:
+                            file_index[(region, fov)] = str(ome_path)
+                            break
+            
+            if not file_index:
+                return None
+            
+            # Extract metadata using tifffile only (no BioImage during graph construction)
+            first_file = next(iter(file_index.values()))
+            with tf.TiffFile(first_file) as tif:
+                series = tif.series[0]
+                axes = series.axes
+                shape = series.shape
+                shape_dict = dict(zip(axes, shape))
+                
+                n_t = shape_dict.get('T', 1)
+                n_c = shape_dict.get('C', 1) 
+                n_z = shape_dict.get('Z', 1)
+                height = shape_dict.get('Y', shape[-2])
+                width = shape_dict.get('X', shape[-1])
+                
+                # Extract channel names from OME-XML
+                channel_names = []
+                try:
+                    if tif.ome_metadata:
+                        import xml.etree.ElementTree as ET
+                        root = ET.fromstring(tif.ome_metadata)
+                        ns = {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
+                        for ch in root.findall('.//ome:Channel', ns):
+                            name = ch.get('Name') or ch.get('ID', '')
+                            if name:
+                                channel_names.append(name)
+                except:
+                    pass
+            
+            # Build LUTs
+            luts = {}
+            for i in range(n_c):
+                name = channel_names[i] if i < len(channel_names) else f'Channel_{i}'
+                luts[i] = self._get_channel_colormap_from_name(name, i)
+            
+            n_fov = len(all_fovs)
+            
+            # Memory protection: Estimate graph size and limit if needed
+            total_chunks = n_t * n_fov
+            chunk_size_mb = (n_z * n_c * height * width * 2) / (1024**2)
+            estimated_graph_mb = total_chunks * 0.001  # ~1KB metadata per chunk
+            
+            print(f"Dataset: {n_t}T × {n_fov}FOV × {n_z}Z × {n_c}C")
+            print(f"Chunks: {total_chunks} ({chunk_size_mb:.1f} MB each)")
+            print(f"Graph overhead: ~{estimated_graph_mb:.1f} MB")
+            
+            # If graph would be huge, limit to first timepoint only
+            if total_chunks > 10000:  # >10k chunks = risky
+                print(f"WARNING: {total_chunks} chunks detected - limiting to first timepoint")
+                n_t = 1
+            
+            # Efficient chunking: Load entire FOV volumes (Z×C×Y×X) as single chunks
+            # Reduces graph from T×FOV×Z×C chunks to just T×FOV chunks (1000x reduction!)
+            def load_fov_volume(fov_idx, t_idx):
+                """Load entire FOV volume (all Z-slices and channels) in one operation"""
+                def _load():
+                    bio = None
+                    try:
+                        region, fov = all_fovs[fov_idx]['region'], all_fovs[fov_idx]['fov']
+                        filepath = file_index.get((region, fov))
+                        if not filepath:
+                            return np.zeros((n_z, n_c, height, width), dtype=np.uint16)
+                        
+                        bio = BioImage(filepath)
+                        # Load entire volume at once: (Z, C, Y, X)
+                        volume = np.zeros((n_z, n_c, height, width), dtype=np.uint16)
+                        for z_idx in range(n_z):
+                            for c_idx in range(n_c):
+                                volume[z_idx, c_idx] = bio.get_image_data("YX", T=t_idx, C=c_idx, Z=z_idx)
+                        del bio
+                        return volume
+                    except:
+                        if bio:
+                            del bio
+                        return np.zeros((n_z, n_c, height, width), dtype=np.uint16)
+                return _load
+            
+            # Build graph with FOV-level chunks (much smaller graph)
+            time_arrays = []
+            for t_idx in range(n_t):
+                fov_arrays = []
+                for fov_idx in range(n_fov):
+                    delayed_load = delayed(load_fov_volume(fov_idx, t_idx))
+                    # Single chunk per FOV: (Z, C, Y, X)
+                    dask_chunk = da.from_delayed(delayed_load(), shape=(n_z, n_c, height, width), dtype=np.uint16)
+                    fov_arrays.append(dask_chunk)
+                time_arrays.append(da.stack(fov_arrays, axis=0))
+            
+            # Stack: (T, FOV, Z, C, Y, X)
+            full_array = da.stack(time_arrays, axis=0)
+            
+            # Create xarray
+            xarr = xr.DataArray(
+                full_array,
+                dims=['time', 'fov', 'z_level', 'channel', 'y', 'x'],
+                coords={
+                    'time': list(range(n_t)),
+                    'fov': list(range(n_fov)),
+                    'z_level': list(range(n_z)),
+                    'channel': list(range(n_c))
+                }
+            )
+            
+            xarr.attrs['luts'] = luts
+            return xarr
+            
+        except Exception as e:
+            print(f"Error in unified OME loader: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _create_unified_single_tiff_lazy_array(self, all_fovs: List[Dict]) -> Optional[xr.DataArray]:
+        """
+        Create unified lazy array for Single-TIFF - scans files ONCE to build index,
+        then creates lazy graph.
+        """
+        try:
+            base_path = Path(self.base_path)
+            
+            # Build complete file index in ONE scan
+            file_index = {}  # {(t, region, fov, z, channel): filepath}
+            timepoint_set = set()
+            z_set = set()
+            channel_set = set()
+            
+            for tp_dir in sorted(base_path.iterdir()):
+                if not (tp_dir.is_dir() and tp_dir.name.isdigit()):
+                    continue
+                t = int(tp_dir.name)
+                timepoint_set.add(t)
+                
+                for tiff_path in tp_dir.glob("*.tiff"):
+                    if m := fpattern.search(tiff_path.name):
+                        region = m.group("r")
+                        fov = int(m.group("f"))
+                        z = int(m.group("z"))
+                        channel = m.group("c")
+                        
+                        z_set.add(z)
+                        channel_set.add(channel)
+                        file_index[(t, region, fov, z, channel)] = str(tiff_path)
+            
+            # Organize dimensions
+            timepoints = sorted(timepoint_set)
+            z_levels = sorted(z_set)
+            channels = sorted(channel_set)
+            
+            n_t = len(timepoints)
+            n_fov = len(all_fovs)
+            n_z = len(z_levels)
+            n_c = len(channels)
+            
+            # Get dimensions from one sample file
+            sample_file = next(iter(file_index.values()))
+            sample_tiff = tf.TiffFile(sample_file)
+            height, width = sample_tiff.pages[0].shape[-2:]
+            sample_tiff.close()
+            
+            # Efficient chunking: Load entire FOV volumes (Z×C×Y×X) as single chunks
+            def load_fov_volume_tiff(fov_idx, t_idx):
+                """Load entire FOV volume (all Z-slices and channels) in one operation"""
+                def _load():
+                    try:
+                        t = timepoints[t_idx]
+                        region, fov = all_fovs[fov_idx]['region'], all_fovs[fov_idx]['fov']
+                        
+                        # Load entire volume: (Z, C, Y, X)
+                        volume = np.zeros((n_z, n_c, height, width), dtype=np.uint16)
+                        for z_idx in range(n_z):
+                            for c_idx in range(n_c):
+                                z = z_levels[z_idx]
+                                channel = channels[c_idx]
+                                filepath = file_index.get((t, region, fov, z, channel))
+                                if filepath:
+                                    with tf.TiffFile(filepath) as tiff:
+                                        volume[z_idx, c_idx] = tiff.pages[0].asarray()
+                        return volume
+                    except:
+                        return np.zeros((n_z, n_c, height, width), dtype=np.uint16)
+                return _load
+            
+            # Build graph with FOV-level chunks
+            time_arrays = []
+            for t_idx in range(n_t):
+                fov_arrays = []
+                for fov_idx in range(n_fov):
+                    delayed_load = delayed(load_fov_volume_tiff(fov_idx, t_idx))
+                    dask_chunk = da.from_delayed(delayed_load(), shape=(n_z, n_c, height, width), dtype=np.uint16)
+                    fov_arrays.append(dask_chunk)
+                time_arrays.append(da.stack(fov_arrays, axis=0))
+            
+            full_array = da.stack(time_arrays, axis=0)
+            
+            # Create xarray
+            xarr = xr.DataArray(
+                full_array,
+                dims=['time', 'fov', 'z_level', 'channel', 'y', 'x'],
+                coords={
+                    'time': timepoints,
+                    'fov': list(range(n_fov)),
+                    'z_level': z_levels,
+                    'channel': channels
+                }
+            )
+            
+            return xarr
+            
+        except Exception as e:
+            print(f"Error in unified single-TIFF loader: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _discover_all_fovs(self) -> List[Dict]:
+        """
+        Discover all unique FOVs in the dataset.
+        
+        Returns:
+            List of dicts: [{'fov': 0, 'region': 'A1'}, {'fov': 1, 'region': 'A1'}, ...]
+        """
+        base_path = Path(self.base_path)
+        format_type = detect_acquisition_format(base_path)
+        fov_set = set()
+        
+        # Look in first timepoint directory
+        first_tp = next((d for d in base_path.iterdir() if d.is_dir() and d.name.isdigit()), None)
+        if not first_tp:
+            return []
+        
+        if format_type == 'ome_tiff':
+            # Scan OME-TIFF directory
+            ome_dir = base_path / "ome_tiff" if (base_path / "ome_tiff").exists() else first_tp
+            for ome_file in ome_dir.glob("*.ome.tif*"):
+                if m := fpattern_ome.search(ome_file.name):
+                    region = m.group("r")
+                    fov = int(m.group("f"))
+                    fov_set.add((region, fov))
+        else:
+            # Scan single-TIFF files
+            for tiff_file in first_tp.glob("*.tiff"):
+                if m := fpattern.search(tiff_file.name):
+                    region = m.group("r")
+                    fov = int(m.group("f"))
+                    fov_set.add((region, fov))
+        
+        # Convert to sorted list of dicts
+        fov_list = [{'region': region, 'fov': fov} for region, fov in sorted(fov_set)]
+        return fov_list
+    
     def create_fov_zarr_array(self, target_fov: int, target_region: str = None) -> Optional[xr.DataArray]:
-        """Create a lazy-loading xarray DataArray using O(1) file lookup"""
+        """Create a lazy-loading xarray DataArray using O(1) file lookup (for single FOV, HCS mode)"""
         if not ZARR_AVAILABLE:
             print("Zarr/tifffile/xarray not available")
             return None
@@ -689,15 +1098,13 @@ class TiffViewerWidget(QWidget):
                                 fov_files.append(str(tiff_path))
             
             if not fov_files:
-                print(f"No files found for FOV {target_fov} in region {target_region}")
                 return None
             
-            print(f"Found {len(fov_files)} files for FOV {target_fov} in region {target_region}")
             axes, shape, indices, sorted_files = parse_filenames(fov_files)
-            print(f"Parsed dimensions - axes: {axes}, shape: {shape}")
             sample_tiff = tf.TiffFile(sorted_files[0])
             sample_shape = sample_tiff.pages[0].shape
             height, width = sample_shape[-2:]
+            sample_tiff.close()  # ✓ CRITICAL: Close after getting dimensions
             
             file_lookup = {}
             for idx, file_path in enumerate(sorted_files):
@@ -706,9 +1113,11 @@ class TiffViewerWidget(QWidget):
             
             def load_single_file(file_path, coords=None):
                 def _load():
+                    tiff = None
                     try:
                         tiff = tf.TiffFile(file_path)
                         data = np.array(tiff.pages[0].asarray())
+                        tiff.close()  # ✓ CRITICAL: Close file immediately
                         
                         # # Apply flatfield correction - DISABLED (Less is more)
                         # if flatfield_data and coords is not None and len(axes) >= 5:
@@ -722,6 +1131,8 @@ class TiffViewerWidget(QWidget):
                         return data
                     except Exception as e:
                         print(f"Error loading {file_path}: {e}")
+                        if tiff:
+                            tiff.close()
                         return np.zeros((height, width), dtype=np.uint16)
                 return _load
             
@@ -783,7 +1194,6 @@ class TiffViewerWidget(QWidget):
                         coords_dict[axis] = list(range(full_array.shape[i]))
                 
                 xarray_data = xr.DataArray(full_array, dims=final_axes, coords=coords_dict, name="image_data")
-                print(f"Created lazy xarray DataArray with shape: {xarray_data.shape}")
                 return xarray_data
         except Exception as e:
             print(f"Error creating lazy FOV xarray: {e}")
@@ -810,7 +1220,6 @@ class TiffViewerWidget(QWidget):
                         break
             
             if not ome_file:
-                print(f"No OME-TIFF file found for FOV {target_fov} in region {target_region}")
                 return None
             
             # Load with bioio - handles all dimension complexity
@@ -823,17 +1232,14 @@ class TiffViewerWidget(QWidget):
             height = bio_img.dims.Y
             width = bio_img.dims.X
             
-            print(f"Found OME-TIFF for FOV {target_fov}: C={n_channels}, Z={n_z}, T={n_timepoints}")
-            
             # Extract channel names from bioio metadata
             channel_names = []
             try:
                 # bioio provides channel names through physical_pixel_sizes or ome metadata
                 if hasattr(bio_img, 'channel_names') and bio_img.channel_names:
                     channel_names = list(bio_img.channel_names)
-                    print(f"Channel names from bioio: {channel_names}")
-            except Exception as e:
-                print(f"Could not extract channel names: {e}")
+            except:
+                pass
             
             # Build colormap LUTs from actual channel names
             luts = {}
@@ -842,15 +1248,19 @@ class TiffViewerWidget(QWidget):
                 name = channel_names[i] if i < len(channel_names) else f'Channel_{i}'
                 colormap = self._get_channel_colormap_from_name(name, i)
                 luts[i] = colormap
-                print(f"Channel {i}: '{name}' -> {colormap}")
+            
+            bio_img.close()  # ✓ CRITICAL: Close after getting metadata
             
             # Build lazy dask array structure using bioio: (time, z_level, channel, y, x)
             def load_ome_slice_bioio(filepath, c_idx, z_idx, t_idx):
                 def _load():
+                    bio = None
                     try:
                         bio = BioImage(filepath)
                         # bioio handles ALL dimension ordering automatically!
-                        return bio.get_image_data("YX", T=t_idx, C=c_idx, Z=z_idx)
+                        data = bio.get_image_data("YX", T=t_idx, C=c_idx, Z=z_idx)
+                        del bio  # Release reference
+                        return data
                     except Exception as e:
                         print(f"Error loading OME slice: {e}")
                         return np.zeros((height, width), dtype=np.uint16)
@@ -881,8 +1291,6 @@ class TiffViewerWidget(QWidget):
                 }
             )
             
-            print(f"Created OME lazy xarray with shape: {xarr.shape}")
-            
             # Store LUTs as attribute for set_ndv_data to use
             xarr.attrs['luts'] = luts
             
@@ -895,7 +1303,10 @@ class TiffViewerWidget(QWidget):
             return None
     
     def _build_stack_async(self):
-        """Build stack in background thread (non-blocking)"""
+        """Build stack in background thread (non-blocking, HCS only)"""
+        if not self.is_hcs_dataset or self.plate_stack is None:
+            return
+        
         # Create builder thread
         self.builder_thread = StackBuilderThread(
             self.base_path,
@@ -938,7 +1349,6 @@ class TiffViewerWidget(QWidget):
             if metadata and 'shape_info' in metadata and metadata['shape_info']:
                 self.wavelengths = metadata['shape_info']['wavelengths']
                 self.colormaps = metadata['shape_info']['colormaps']
-                print(f"[Stack] Using {len(self.colormaps)} channel colormaps: {self.colormaps}")
             
             # Update status
             if hasattr(self, 'status_label'):
@@ -1007,14 +1417,12 @@ class TiffViewerWidget(QWidget):
                                 continue
                             
                             self._plate_contrast_limits[ch_idx] = (float(vmin), float(vmax))
-                            print(f"[Init] Ch{ch_idx} contrast from NDV: [{vmin:.0f}, {vmax:.0f}]")
                             synced_count += 1
-                        except Exception as e:
-                            print(f"[Init] Ch{ch_idx} contrast failed: {e}")
+                        except:
+                            pass
                 
                 # Update plate display with NDV's initial contrast
                 if synced_count > 0:
-                    print(f"[Init] Synced {synced_count}/{len(luts)} channels, updating plate")
                     self.update_image()
                     
             except Exception as e:
@@ -1069,7 +1477,17 @@ class ViewerMainWindow(QMainWindow):
     def __init__(self, base_path: str, timepoint: int = 0, downsample_factor: float = 0.85):
         super().__init__()
         self.setWindowTitle("Multi-Channel TIFF Viewer with Embedded NDV")
-        self.setGeometry(100, 100, 1400, 800)
+        
+        # Detect dataset type to set appropriate window size
+        from .common import detect_hcs_vs_normal_tissue
+        is_hcs = detect_hcs_vs_normal_tissue(Path(base_path))
+        
+        if is_hcs:
+            # HCS: Wide window for split-panel (plate + NDV)
+            self.setGeometry(100, 100, 1400, 800)
+        else:
+            # Normal tissue: Narrower window (NDV only)
+            self.setGeometry(100, 100, 600, 800)
         
         # Apply dark theme
         from PyQt5.QtWidgets import QStyleFactory

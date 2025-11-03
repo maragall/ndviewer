@@ -60,12 +60,9 @@ class PlateStackManager:
             # Try memory-mapping first
             try:
                 self._memmap = tf.memmap(str(self.stack_file), mode='r')
-                print(f"✓ Loaded plate stack (memory-mapped): {self._memmap.shape}")
-            except Exception as memmap_err:
+            except:
                 # Fallback: load entire stack into memory
-                print(f"Memory-mapping failed ({memmap_err}), loading into RAM...")
                 self._memmap = tf.imread(str(self.stack_file))
-                print(f"✓ Loaded plate stack (RAM): {self._memmap.shape}")
             
             # Load metadata
             if metadata_file.exists():

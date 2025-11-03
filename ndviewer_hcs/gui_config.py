@@ -90,22 +90,9 @@ class PreprocessingThread(QThread):
     def run(self):
         try:
             self.progress.emit("Starting preprocessing...")
-            
-            # # Handle flatfield option - DISABLED (Less is more)
-            # flatfields = None
-            # if self.flatfield_option == "compute":
-            #     self.progress.emit("Computing flatfields...")
-            #     ff_manager = FlatfieldManager(self.base_path)
-            #     flatfields = ff_manager.compute_flatfields()
-            # elif self.flatfield_option == "load" and self.flatfield_path:
-            #     self.progress.emit("Loading flatfields...")
-            #     ff_manager = FlatfieldManager(self.base_path)
-            #     flatfields = ff_manager.load_flatfields(self.flatfield_path)
-            
-            # Assemble plate (no flatfield correction)
             self.progress.emit("Assembling plate...")
+            
             assembler = PlateAssembler(self.base_path, timepoint=0)
-            # Convert downsample_factor to target_pixel_size for assembler
             original_px = assembler._get_original_pixel_size()
             target_px = int(original_px * self.downsample_factor)
             assembler.assemble_plate(target_px, flatfields=None, 
@@ -178,12 +165,6 @@ class ConfigurationGUI(QMainWindow):
             self.dropbox.set_status("Error: Could not read parameters")
             print("Error: Could not read sensor_pixel_size_um from acquisition_parameters.json")
     
-    # def browse_flatfield(self):  # DISABLED (Less is more)
-    #     file_path, _ = QFileDialog.getOpenFileName(self, "Select Flatfield File", "", "Flatfield Files (*.pkl *.npy)")
-    #     if file_path:
-    #         self.flatfield_path = file_path
-    #         QMessageBox.information(self, "Flatfield Selected", f"Selected: {Path(file_path).name}")
-    
     def read_sensor_pixel_size(self, acquisition_dir: str) -> float:
         """Read sensor_pixel_size_um from acquisition_parameters.json"""
         try:
@@ -250,9 +231,20 @@ class ConfigurationGUI(QMainWindow):
         if not self.acquisition_dir:
             return
         
-        self.dropbox.set_status("Checking for cached data...")
+        self.dropbox.set_status("Detecting dataset type...")
         
-        # Check if preprocessing is needed
+        # Detect dataset type FIRST
+        from .common import detect_hcs_vs_normal_tissue
+        is_hcs = detect_hcs_vs_normal_tissue(Path(self.acquisition_dir))
+        
+        if not is_hcs:
+            # Normal tissue - skip preprocessing entirely, launch viewer directly
+            self.dropbox.set_status("Normal tissue detected...")
+            self.launch_viewer()
+            return
+        
+        # HCS dataset - check if preprocessing is needed
+        self.dropbox.set_status("Checking for cached data...")
         from .preprocessing import PlateAssembler
         assembler = PlateAssembler(self.acquisition_dir, timepoint=0)
         cache_key = assembler._get_cache_key(self.downsample_factor, self.downsample_factor >= 0.98)

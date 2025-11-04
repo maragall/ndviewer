@@ -540,6 +540,14 @@ class TiffViewerWidget(QWidget):
     def _create_ndv_luts(self):
         """Create LUT dictionary for NDV viewer based on channel wavelengths"""
         luts = {}
+        if self.wavelengths is None:
+            # Default LUTs for datasets without wavelength info
+            # Use standard matplotlib colormaps that NDV recognizes
+            default_colors = ['blue', 'green', 'yellow', 'red', 'Reds']
+            for i in range(5):  # Support up to 5 channels by default
+                luts[i] = default_colors[i]
+            return luts
+        
         for i, wavelength in enumerate(self.wavelengths):
             luts[i] = self._get_channel_colormap_from_name(wavelength, i)
         return luts
@@ -552,7 +560,7 @@ class TiffViewerWidget(QWidget):
         - 488nm -> green  
         - 561nm -> yellow
         - 638/640nm -> red
-        - 730nm -> darkred
+        - 730nm -> magenta
         - _B suffix -> blue
         - _G suffix -> green
         - _R suffix -> red
@@ -569,7 +577,7 @@ class TiffViewerWidget(QWidget):
         elif '638' in name_upper or '640' in name_upper:
             return 'red'
         elif '730' in name_upper:
-            return 'darkred'
+            return 'Reds'  # Sequential colormap for far-red/near-infrared
         # Check for suffix patterns
         elif name_upper.endswith('_B'):
             return 'blue'
@@ -579,7 +587,7 @@ class TiffViewerWidget(QWidget):
             return 'red'
         # Default color based on index
         else:
-            default_colors = ['blue', 'green', 'yellow', 'red', 'darkred']
+            default_colors = ['blue', 'green', 'yellow', 'red', 'Reds']
             return default_colors[index] if index < len(default_colors) else 'gray'
 
     def set_ndv_data(self, data):

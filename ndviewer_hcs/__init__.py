@@ -4,7 +4,7 @@ A modular viewer for high-content screening data with preprocessing and visualiz
 """
 
 from .common import TileData, parse_filenames
-from .preprocessing import FlatfieldManager, PlateAssembler
+from .preprocessing import PlateAssembler
 from .viewer import TiffViewerWidget, ViewerMainWindow
 from .gui_config import ConfigurationGUI
 from .ndviewer_hcs import main
@@ -12,7 +12,6 @@ from .ndviewer_hcs import main
 __all__ = [
     'TileData',
     'parse_filenames',
-    'FlatfieldManager',
     'PlateAssembler',
     'TiffViewerWidget',
     'ViewerMainWindow',

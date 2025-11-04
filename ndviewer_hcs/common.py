@@ -196,27 +196,3 @@ def detect_hcs_vs_normal_tissue(dataset_directory_path: Path) -> bool:
     
     return is_hcs
 
-class ImageProcessor:
-    @staticmethod
-    def downsample_fast(img: np.ndarray, target_size: int) -> np.ndarray:
-        h, w = img.shape[:2]
-        if h <= target_size and w <= target_size:
-            result = np.zeros((target_size, target_size) + img.shape[2:], dtype=img.dtype)
-            result[:min(h, target_size), :min(w, target_size)] = img[:min(h, target_size), :min(w, target_size)]
-            return result
-        
-        factor = max(h, w) / target_size
-        if factor > 4:
-            kernel = int(factor)
-            crop_h, crop_w = (h // kernel) * kernel, (w // kernel) * kernel
-            cropped = img[:crop_h, :crop_w]
-            if len(img.shape) == 3:
-                reshaped = cropped.reshape(crop_h // kernel, kernel, crop_w // kernel, kernel, img.shape[2])
-                return reshaped.mean(axis=(1, 3)).astype(img.dtype)
-            else:
-                reshaped = cropped.reshape(crop_h // kernel, kernel, crop_w // kernel, kernel)
-                return reshaped.mean(axis=(1, 3)).astype(img.dtype)
-        
-        step = max(1, int(max(h, w) / target_size))
-        return img[::step, ::step]
-

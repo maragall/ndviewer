@@ -12,8 +12,35 @@ import matplotlib.pyplot as plt
 from skimage import io
 # from basicpy import BaSiC
 
-from .common import TileData, ImageProcessor, COLOR_MAPS, detect_acquisition_format, fpattern_ome
+from .common import TileData, COLOR_MAPS, detect_acquisition_format, fpattern_ome
 import tifffile as tf
+
+
+class ImageProcessor:
+    """Fast image downsampling utilities for preprocessing"""
+    @staticmethod
+    def downsample_fast(img: np.ndarray, target_size: int) -> np.ndarray:
+        h, w = img.shape[:2]
+        if h <= target_size and w <= target_size:
+            result = np.zeros((target_size, target_size) + img.shape[2:], dtype=img.dtype)
+            result[:min(h, target_size), :min(w, target_size)] = img[:min(h, target_size), :min(w, target_size)]
+            return result
+        
+        factor = max(h, w) / target_size
+        if factor > 4:
+            kernel = int(factor)
+            crop_h, crop_w = (h // kernel) * kernel, (w // kernel) * kernel
+            cropped = img[:crop_h, :crop_w]
+            if len(img.shape) == 3:
+                reshaped = cropped.reshape(crop_h // kernel, kernel, crop_w // kernel, kernel, img.shape[2])
+                return reshaped.mean(axis=(1, 3)).astype(img.dtype)
+            else:
+                reshaped = cropped.reshape(crop_h // kernel, kernel, crop_w // kernel, kernel)
+                return reshaped.mean(axis=(1, 3)).astype(img.dtype)
+        
+        step = max(1, int(max(h, w) / target_size))
+        return img[::step, ::step]
+
 
 class FlatfieldManager:
     """Manages flatfield computation and caching"""
@@ -466,4 +493,3 @@ class PlateAssembler:
             'wavelengths': wavelengths,
             'colormaps': colormaps
         }, tile_map
-

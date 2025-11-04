@@ -167,50 +167,30 @@ def detect_hcs_vs_normal_tissue(dataset_directory_path: Path) -> bool:
         print(f"No timepoint directories found in {dataset_dir}")
         return False  # No timepoint directories = not HCS
     
-    # STEP 3: Analyze files and region naming patterns
-    total_image_files = 0
+    # STEP 3: Analyze files and check for wellplate naming patterns
     wellplate_regions = set()
     
     for timepoint_dir in timepoint_dirs:
         # Look for image files (OME-TIFF, TIFF, etc.)
-        image_files = []
         for item in timepoint_dir.iterdir():
             if item.is_file() and item.suffix.lower() in ['.tiff', '.tif', '.ome.tiff', '.ome.tif']:
-                image_files.append(item)
-            elif item.is_dir():  # Could be other directory-based formats
-                image_files.append(item)
-        
-        total_image_files += len(image_files)
-        
-        # STEP 4: Extract and analyze region names for wellplate patterns
-        for image_file in image_files:
-            region_name = extract_region_name_from_path(image_file)
-            
-            if not region_name or region_name.startswith("._"):
-                continue
-            
-            # KEY PATTERN: Check for wellplate naming (letter(s) + number(s))
-            # Examples: A1, B2, C12, AA1, AB24, etc.
-            wellplate_match = re.match(r'^([A-Z]+)(\d+)$', region_name)
-            if wellplate_match:
-                wellplate_regions.add(region_name)
+                region_name = extract_region_name_from_path(item)
+                
+                if not region_name or region_name.startswith("._"):
+                    continue
+                
+                # KEY PATTERN: Check for wellplate naming (letter(s) + number(s))
+                # Examples: A1, B2, C12, AA1, AB24, etc.
+                if re.match(r'^([A-Z]+)(\d+)$', region_name):
+                    wellplate_regions.add(region_name)
     
-    if total_image_files == 0:
-        print(f"No image files found in timepoint directories")
-        return False  # No image files = not HCS
-    
-    # STEP 5: Final HCS determination logic
-    # HCS dataset if ANY of these conditions are met:
-    is_hcs = (
-        len(timepoint_dirs) > 1 or                    # Multiple timepoints
-        len(wellplate_regions) > 1 or                 # Multiple wellplate regions  
-        (len(timepoint_dirs) == 1 and total_image_files > 1)  # Single timepoint, multiple files
-    )
+    # STEP 4: Final HCS determination logic
+    # HCS dataset ONLY if we found wellplate naming patterns (e.g., A1, B2, C12)
+    # Wellplate naming is the ONLY reliable indicator of an HCS dataset
+    is_hcs = len(wellplate_regions) > 0
     
     # Log detection results
     print(f"[HCS Detection] Dataset: {dataset_dir.name}")
-    print(f"  - Timepoint directories: {len(timepoint_dirs)}")
-    print(f"  - Total image files: {total_image_files}")
     print(f"  - Wellplate regions detected: {len(wellplate_regions)} {list(wellplate_regions)[:5]}")
     print(f"  - Result: {'HCS/Wellplate' if is_hcs else 'Normal Tissue'}")
     

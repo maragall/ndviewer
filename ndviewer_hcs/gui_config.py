@@ -27,7 +27,7 @@ class DropBox(QFrame):
         self.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
         self.setStyleSheet("""
             DropBox {
-                background-color: #2b2b2b;
+                background-color: #828282;
                 border: 2px dashed #666;
                 border-radius: 5px;
             }
@@ -38,7 +38,7 @@ class DropBox(QFrame):
         """)
         
         layout = QVBoxLayout()
-        self.label = QLabel("")  # Empty label
+        self.label = QLabel("Drop Folder Here")  # Empty label
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setStyleSheet("border: none;")
         layout.addWidget(self.label)

@@ -1,4 +1,4 @@
-"""Preprocessing: flatfield correction and plate assembly"""
+"""Preprocessing: plate assembly and tile stitching"""
 
 import pickle
 import random
@@ -42,102 +42,6 @@ class ImageProcessor:
         return img[::step, ::step]
 
 
-class FlatfieldManager:
-    """Manages flatfield computation and caching"""
-    
-    def __init__(self, base_path: str):
-        self.base_path = Path(base_path)
-        self.cache_dir = self.base_path / "assembled_tiles_cache"
-        self.cache_dir.mkdir(exist_ok=True)
-    
-    def compute_flatfields(self, sample_count: int = 48) -> Dict[str, np.ndarray]:
-        """Compute flatfields from random sample of images across all timepoints"""
-        cache_file = self.cache_dir / "flatfields_global.pkl"
-        
-        if cache_file.exists():
-            print("Loading cached flatfields...")
-            with open(cache_file, 'rb') as f:
-                return pickle.load(f)
-        
-        print("Computing flatfields from scratch...")
-        wavelength_files = defaultdict(list)
-        
-        for timepoint_dir in self.base_path.iterdir():
-            if not timepoint_dir.is_dir() or not timepoint_dir.name.isdigit():
-                continue
-            for filepath in timepoint_dir.glob("*.tiff"):
-                parsed = self._parse_filename(filepath)
-                if parsed:
-                    wavelength = parsed[3]
-                    wavelength_files[wavelength].append(filepath)
-        
-        flatfields = {}
-        for wavelength, files in wavelength_files.items():
-            print(f"Computing flatfield for {wavelength}nm...")
-            sample_files = random.sample(files, min(sample_count, len(files)))
-            timepoint_count = len(set(f.parent.name for f in sample_files))
-            print(f"  Using {len(sample_files)} images from {timepoint_count} timepoints")
-            
-            stack = []
-            for i, filepath in enumerate(sample_files):
-                if i % 10 == 0:
-                    print(f"  Loading image {i+1}/{len(sample_files)}")
-                img = io.imread(filepath).astype(np.float32)
-                stack.append(img)
-            
-            stack = np.array(stack)
-            print(f"  Fitting BaSiC model on stack shape: {stack.shape}")
-            basic = BaSiC(get_darkfield=False, smoothness_flatfield=1)
-            basic.fit(stack)
-            flatfields[wavelength] = basic.flatfield.astype(np.float32)
-            
-            # Save visualization
-            plt.figure(figsize=(10, 8))
-            plt.imshow(flatfields[wavelength], cmap='viridis')
-            plt.colorbar(label='Flatfield intensity')
-            plt.title(f'Flatfield for {wavelength}nm')
-            plt.tight_layout()
-            png_path = self.cache_dir / f"flatfield_{wavelength}nm.png"
-            plt.savefig(png_path, dpi=150, bbox_inches='tight')
-            plt.close()
-            print(f"  Saved flatfield visualization: {png_path}")
-            
-            del stack
-        
-        with open(cache_file, 'wb') as f:
-            pickle.dump(flatfields, f)
-        print(f"Cached flatfields to {cache_file}")
-        
-        return flatfields
-    
-    def load_flatfields(self, npy_path: str = None) -> Dict[str, np.ndarray]:
-        """Load flatfields from .npy file or cache"""
-        if npy_path:
-            # Load from provided .npy file
-            print(f"Loading flatfields from {npy_path}")
-            return np.load(npy_path, allow_pickle=True).item()
-        else:
-            # Load from cache
-            cache_file = self.cache_dir / "flatfields_global.pkl"
-            if cache_file.exists():
-                with open(cache_file, 'rb') as f:
-                    return pickle.load(f)
-        return {}
-    
-    def _parse_filename(self, filepath: Path) -> Optional[Tuple]:
-        import re
-        match = re.match(r"([A-Z]+\d+)_(\d+)_(\d+)_.*_(\d+)_nm_Ex\.tiff", filepath.name)
-        return match.groups() if match else None
-    
-    @staticmethod
-    def apply_flatfield_correction(img: np.ndarray, flatfield: np.ndarray) -> np.ndarray:
-        """Apply flatfield correction to an image"""
-        img_float = img.astype(np.float32)
-        mean_ff = flatfield.mean()
-        corrected = img_float / flatfield * mean_ff
-        return np.clip(corrected, 0, np.iinfo(img.dtype).max).astype(img.dtype)
-
-
 class PlateAssembler:
     """Assembles full plate from tiles with optional preprocessing"""
     
@@ -155,9 +59,8 @@ class PlateAssembler:
     
     def assemble_plate(self, 
                       target_pixel_size: int,
-                      flatfields: Dict = None,
                       output_dir: str = None) -> Tuple[Dict, Dict]:  # output_dir kept for compatibility but ignored
-        """Assemble plate with downsampling and optional flatfield correction
+        """Assemble plate with downsampling
         
         Returns:
             assembled_images: dict with 'multichannel', 'wavelengths', 'colormaps'
@@ -173,7 +76,7 @@ class PlateAssembler:
             return self._load_from_cache(cache_key)
         
         # Load and process tiles
-        tiles = self._load_tiles(flatfields, downsample_factor, skip_downsampling)
+        tiles = self._load_tiles(downsample_factor, skip_downsampling)
         assembled_images, tile_map = self._assemble_images(tiles)
         
         if assembled_images:
@@ -284,16 +187,16 @@ class PlateAssembler:
         else:
             return 'gray'
     
-    def _load_tiles(self, flatfields: Dict, downsample_factor: float, skip_downsampling: bool, z_level: int = 0) -> Dict:
-        """Load tiles with optional flatfield correction and downsampling"""
+    def _load_tiles(self, downsample_factor: float, skip_downsampling: bool, z_level: int = 0) -> Dict:
+        """Load tiles with downsampling"""
         format_type = detect_acquisition_format(self.base_path)
         
         if format_type == 'ome_tiff':
             return self._load_tiles_from_ome(downsample_factor, skip_downsampling, z_level)
         else:
-            return self._load_tiles_from_single_tiff(flatfields, downsample_factor, skip_downsampling)
+            return self._load_tiles_from_single_tiff(downsample_factor, skip_downsampling)
     
-    def _load_tiles_from_single_tiff(self, flatfields: Dict, downsample_factor: float, skip_downsampling: bool) -> Dict:
+    def _load_tiles_from_single_tiff(self, downsample_factor: float, skip_downsampling: bool) -> Dict:
         """Load tiles from single-TIFF files"""
         timepoint_path = self.base_path / str(self.timepoint)
         coords_df = pd.read_csv(timepoint_path / "coordinates.csv")
@@ -310,10 +213,6 @@ class PlateAssembler:
                 continue
             
             img = io.imread(filepath)
-            
-            # # Apply flatfield correction BEFORE downsampling - DISABLED (Less is more)
-            # if flatfields and wavelength in flatfields:
-            #     img = FlatfieldManager.apply_flatfield_correction(img, flatfields[wavelength])
             
             # Downsample if requested
             if not skip_downsampling and downsample_factor < 0.98:
@@ -493,3 +392,4 @@ class PlateAssembler:
             'wavelengths': wavelengths,
             'colormaps': colormaps
         }, tile_map
+

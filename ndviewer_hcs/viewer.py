@@ -1065,22 +1065,6 @@ class TiffViewerWidget(QWidget):
     def _create_fov_from_single_tiff(self, target_fov: int, target_region: str = None) -> Optional[xr.DataArray]:
         """Load FOV from single-TIFF files (current format)"""
         try:
-            # # Load flatfields if available - DISABLED (Less is more)
-            # flatfield_data = None
-            # wavelength_mapping = {}
-            # flatfields_file = self.cache_dir / "flatfields_global.pkl"
-            # if flatfields_file.exists():
-            #     try:
-            #         with open(flatfields_file, 'rb') as f:
-            #             flatfield_data = pickle.load(f)
-            #         for i, wavelength_name in enumerate(self.wavelengths):
-            #             match = re.search(r'(\d{3})', wavelength_name)
-            #             if match:
-            #                 wavelength_mapping[i] = match.group(1)
-            #     except Exception as e:
-            #         print(f"Error loading flatfields: {e}")
-            #         flatfield_data = None
-            
             # Scan for files from ALL timepoints for this FOV
             # Note: fov_to_files only contains current timepoint, so we need to scan all timepoints
             base_path = Path(self.base_path)
@@ -1118,16 +1102,6 @@ class TiffViewerWidget(QWidget):
                         tiff = tf.TiffFile(file_path)
                         data = np.array(tiff.pages[0].asarray())
                         tiff.close()  # ✓ CRITICAL: Close file immediately
-                        
-                        # # Apply flatfield correction - DISABLED (Less is more)
-                        # if flatfield_data and coords is not None and len(axes) >= 5:
-                        #     channel_idx = coords[4] if 'channel' in axes else None
-                        #     if channel_idx is not None and channel_idx in wavelength_mapping:
-                        #         wavelength_str = wavelength_mapping[channel_idx]
-                        #         if wavelength_str in flatfield_data:
-                        #             flatfield = flatfield_data[wavelength_str]
-                        #             data = data.astype(np.float32) / flatfield.astype(np.float32)
-                        #             data = np.clip(data, 0, np.iinfo(np.uint16).max).astype(np.uint16)
                         return data
                     except Exception as e:
                         print(f"Error loading {file_path}: {e}")

@@ -290,7 +290,6 @@ class StackBuilderThread(QThread):
         # Load tiles for this specific z-level
         # _load_tiles now handles both single-TIFF and OME-TIFF
         tiles = assembler._load_tiles(
-            flatfields=None,
             downsample_factor=self.downsample_factor,
             skip_downsampling=skip_downsampling,
             z_level=z_level
@@ -440,6 +439,3 @@ class NDVContrastSyncController(QObject):
         if self._timer:
             self._timer.stop()
         self._connected = False
-
-
-

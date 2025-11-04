@@ -10,7 +10,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent
 import json
 
-from .preprocessing import FlatfieldManager, PlateAssembler
+from .preprocessing import PlateAssembler
 from .viewer import ViewerMainWindow
 
 
@@ -27,7 +27,7 @@ class DropBox(QFrame):
         self.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
         self.setStyleSheet("""
             DropBox {
-                background-color: #828282;
+                background-color: #2b2b2b;
                 border: 2px dashed #666;
                 border-radius: 5px;
             }
@@ -38,7 +38,7 @@ class DropBox(QFrame):
         """)
         
         layout = QVBoxLayout()
-        self.label = QLabel("Drop Folder Here")  # Empty label
+        self.label = QLabel("")  # Empty label
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setStyleSheet("border: none;")
         layout.addWidget(self.label)
@@ -80,12 +80,10 @@ class PreprocessingThread(QThread):
     progress = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
     
-    def __init__(self, base_path, downsample_factor, flatfield_option, flatfield_path=None):
+    def __init__(self, base_path, downsample_factor):
         super().__init__()
         self.base_path = base_path
         self.downsample_factor = downsample_factor
-        self.flatfield_option = flatfield_option
-        self.flatfield_path = flatfield_path
     
     def run(self):
         try:
@@ -95,8 +93,7 @@ class PreprocessingThread(QThread):
             assembler = PlateAssembler(self.base_path, timepoint=0)
             original_px = assembler._get_original_pixel_size()
             target_px = int(original_px * self.downsample_factor)
-            assembler.assemble_plate(target_px, flatfields=None, 
-                                    output_dir=str(Path(self.base_path) / "assembled_tiles_cache"))
+            assembler.assemble_plate(target_px, output_dir=str(Path(self.base_path) / "assembled_tiles_cache"))
             
             self.finished.emit(True, "Preprocessing completed successfully!")
         except Exception as e:
@@ -117,7 +114,6 @@ class ConfigurationGUI(QMainWindow):
         self.acquisition_dir = None
         self.sensor_pixel_size_um = None
         self.downsample_factor = None
-        self.flatfield_path = None
         
         self.setup_ui()
     
@@ -194,12 +190,10 @@ class ConfigurationGUI(QMainWindow):
         if not self.acquisition_dir:
             return
         
-        # Start preprocessing thread (no flatfield, simplified)
+        # Start preprocessing thread
         self.preprocessing_thread = PreprocessingThread(
             self.acquisition_dir,
-            self.downsample_factor,
-            flatfield_option="none",
-            flatfield_path=None
+            self.downsample_factor
         )
         self.preprocessing_thread.progress.connect(self.on_progress)
         self.preprocessing_thread.finished.connect(self.on_preprocessing_finished)

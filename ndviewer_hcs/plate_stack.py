@@ -80,19 +80,18 @@ class PlateStackManager:
     def get_page(self, t_idx: int, z_idx: int) -> Optional[np.ndarray]:
         """
         Get assembled plate for specific (t, z) indices.
+        Returns memory-mapped view for efficient access without copying.
         
         Returns:
-            Multichannel plate image: (channels, height, width)
+            Memory-mapped plate image: (channels, height, width)
         """
         if self._memmap is None:
             print("Stack not loaded!")
             return None
         
         try:
-            # Index into memmap: [t, z, :, :, :]
-            page = self._memmap[t_idx, z_idx]
-            # Ensure it's loaded into memory (not lazy)
-            return np.array(page)
+            # Return memory-mapped view (no copy, lazy loading)
+            return self._memmap[t_idx, z_idx]
         except IndexError as e:
             print(f"Invalid indices: t={t_idx}, z={z_idx} - {e}")
             return None
@@ -439,3 +438,6 @@ class NDVContrastSyncController(QObject):
         if self._timer:
             self._timer.stop()
         self._connected = False
+
+
+

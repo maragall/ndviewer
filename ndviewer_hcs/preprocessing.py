@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 from skimage import io
 # from basicpy import BaSiC
 
-from .common import TileData, COLOR_MAPS, detect_acquisition_format, fpattern_ome
+from .common import TileData, COLOR_MAPS, detect_acquisition_format, fpattern_ome, extract_wavelength
 import tifffile as tf
 
 
@@ -113,9 +113,18 @@ class PlateAssembler:
         with open(self.cache_dir / f"{cache_key}_metadata.pkl", 'rb') as f:
             metadata = pickle.load(f)
         
+        # Ensure wavelengths are integers (for backward compatibility with old caches)
+        wavelengths = metadata['wavelengths']
+        if wavelengths:
+            if isinstance(wavelengths[0], str):
+                wavelengths = [extract_wavelength(wl) for wl in wavelengths]
+            elif not isinstance(wavelengths[0], int):
+                # Handle any other type by converting to int
+                wavelengths = [int(wl) if isinstance(wl, (int, float)) else extract_wavelength(str(wl)) for wl in wavelengths]
+        
         return {
             'multichannel': multichannel_image,
-            'wavelengths': metadata['wavelengths'],
+            'wavelengths': wavelengths,
             'colormaps': metadata['colormaps']
         }, tile_map
     
@@ -151,8 +160,8 @@ class PlateAssembler:
         match = re.match(r"([A-Z]+\d+)_(\d+)_(\d+)_.*_(\d+)_nm_Ex\.tiff", filepath.name)
         return match.groups() if match else None
     
-    def _get_colormap(self, channel_name: str) -> str:
-        """Get colormap for channel based on wavelength or suffix.
+    def _get_colormap(self, wavelength: int) -> str:
+        """Get colormap for channel based on wavelength (nm).
         
         Mapping:
         - 405nm -> blue
@@ -160,30 +169,17 @@ class PlateAssembler:
         - 561nm -> yellow
         - 638/640nm -> red
         - 730nm -> darkred
-        - _B suffix -> blue
-        - _G suffix -> green
-        - _R suffix -> red
         """
-        name_upper = channel_name.upper()
-        
-        # Check for wavelength numbers
-        if '405' in name_upper:
+        if wavelength <= 420:
             return 'blue'
-        elif '488' in name_upper:
+        elif 470 <= wavelength <= 510:
             return 'green'
-        elif '561' in name_upper:
+        elif 540 <= wavelength <= 590:
             return 'yellow'
-        elif '638' in name_upper or '640' in name_upper:
+        elif 620 <= wavelength <= 660:
             return 'red'
-        elif '730' in name_upper:
+        elif wavelength >= 700:
             return 'darkred'
-        # Check for suffix patterns
-        elif name_upper.endswith('_B'):
-            return 'blue'
-        elif name_upper.endswith('_G'):
-            return 'green'
-        elif name_upper.endswith('_R'):
-            return 'red'
         else:
             return 'gray'
     
@@ -207,7 +203,8 @@ class PlateAssembler:
             if not parsed:
                 continue
             
-            region, fov, z, wavelength = parsed
+            region, fov, z, wavelength_str = parsed
+            wavelength = int(wavelength_str)  # Convert to int
             coord_row = coords_df[(coords_df['region'] == region) & (coords_df['fov'] == int(fov))]
             if coord_row.empty:
                 continue
@@ -286,6 +283,7 @@ class PlateAssembler:
                     
                     # Use actual channel names from OME metadata if available
                     channel_name = channel_names[c_idx] if c_idx < len(channel_names) else f'Channel_{c_idx}'
+                    wavelength = extract_wavelength(channel_name)
                     
                     # Downsample if requested
                     if not skip_downsampling and downsample_factor < 0.98:
@@ -293,14 +291,14 @@ class PlateAssembler:
                         if target_size < min(img.shape[:2]) - 1:
                             img = ImageProcessor.downsample_fast(img, target_size)
                     
-                    tiles[(region, fov, channel_name)] = TileData(
+                    tiles[(region, fov, wavelength)] = TileData(
                         image=img,
                         x_mm=coord_row['x (mm)'].iloc[0],
                         y_mm=coord_row['y (mm)'].iloc[0],
                         file_path=str(ome_file),
                         region=region,
                         fov=fov,
-                        wavelength=channel_name
+                        wavelength=wavelength
                     )
                 
                 # Release reference after extracting all channels

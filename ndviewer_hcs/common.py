@@ -27,7 +27,48 @@ class TileData:
     file_path: str
     region: str
     fov: int
-    wavelength: str
+    wavelength: int
+
+def extract_wavelength(channel_str: str) -> int:
+    """Extract wavelength in nm from channel string.
+    
+    Examples:
+        '488_nm_Ex' -> 488
+        'DAPI' -> 405
+        'GFP' -> 488
+        'mCherry' -> 561
+        'Channel_0' -> 0
+    """
+    # Direct wavelength patterns
+    match = re.search(r'(\d{3,4})\s*nm', channel_str, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    
+    # Common fluorophore names
+    fluor_map = {
+        'dapi': 405, 'hoechst': 405,
+        'gfp': 488, 'fitc': 488, 'alexa488': 488,
+        'tritc': 561, 'cy3': 561, 'mcherry': 561, 'dsred': 561,
+        'cy5': 640, 'alexa647': 640,
+        'cy7': 730
+    }
+    
+    channel_lower = channel_str.lower()
+    for fluor, wl in fluor_map.items():
+        if fluor in channel_lower:
+            return wl
+    
+    # Fallback: extract any number or return 0
+    match = re.search(r'\d+', channel_str)
+    return int(match.group(0)) if match else 0
+
+def _natural_sort_key(s: str) -> tuple:
+    """Natural sort key for wellplate regions (A1, A2, ..., Z1, AA1, etc.)"""
+    match = re.match(r'^([A-Z]+)(\d+)$', s)
+    if match:
+        letters, numbers = match.groups()
+        return (letters, int(numbers))
+    return (s, 0)
 
 def parse_filenames(filenames: Sequence[str]) -> tuple:
     """Parse a sequence of TIFF file paths to extract multi-dimensional metadata."""
@@ -52,22 +93,22 @@ def parse_filenames(filenames: Sequence[str]) -> tuple:
     metadata = [p[1] for p in parsed]
 
     times = sorted({md[0] for md in metadata})
-    regions = sorted({md[1] for md in metadata})
+    regions = sorted({md[1] for md in metadata}, key=_natural_sort_key)
     fovs = sorted({md[2] for md in metadata})
     z_levels = sorted({md[3] for md in metadata})
     channels = sorted({md[4] for md in metadata})
 
-    axes = ("time", "region", "fov", "z_level", "channel")
-    shape = (len(times), len(regions), len(fovs), len(z_levels), len(channels))
+    axes = ("fov", "region", "channel", "z_level", "time")
+    shape = (len(fovs), len(regions), len(channels), len(z_levels), len(times))
 
     indices = []
     for md in metadata:
-        t_idx = times.index(md[0])
-        r_idx = regions.index(md[1])
         f_idx = fovs.index(md[2])
-        z_idx = z_levels.index(md[3])
+        r_idx = regions.index(md[1])
         c_idx = channels.index(md[4])
-        indices.append((t_idx, r_idx, f_idx, z_idx, c_idx))
+        z_idx = z_levels.index(md[3])
+        t_idx = times.index(md[0])
+        indices.append((f_idx, r_idx, c_idx, z_idx, t_idx))
 
     return axes, shape, indices, sorted_files
 

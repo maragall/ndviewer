@@ -10,7 +10,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from skimage import io
-# from basicpy import BaSiC
 
 from .common import TileData, COLOR_MAPS, detect_acquisition_format, fpattern_ome, extract_wavelength
 import tifffile as tf

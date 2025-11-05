@@ -13,7 +13,7 @@ from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen
 from PyQt5.QtCore import Qt, pyqtSignal
 
 from .common import (COLOR_WEIGHTS, parse_filenames, fpattern, fpattern_ome, 
-                     detect_acquisition_format, detect_hcs_vs_normal_tissue)
+                     detect_acquisition_format, detect_hcs_vs_normal_tissue, extract_wavelength)
 from .plate_stack import PlateStackManager, StackBuilderThread, NDVSyncController, NDVContrastSyncController
 
 # NDV and zarr imports
@@ -549,45 +549,32 @@ class TiffViewerWidget(QWidget):
             return luts
         
         for i, wavelength in enumerate(self.wavelengths):
-            luts[i] = self._get_channel_colormap_from_name(wavelength, i)
+            luts[i] = self._get_channel_colormap(wavelength, i)
         return luts
     
-    def _get_channel_colormap_from_name(self, channel_name: str, index: int) -> str:
-        """Get colormap for a channel based on its name or wavelength.
+    def _get_channel_colormap(self, wavelength: int, index: int) -> str:
+        """Get colormap for channel based on wavelength (nm).
         
-        Based on wavelength detection:
+        Mapping:
         - 405nm -> blue
-        - 488nm -> green  
+        - 488nm -> green
         - 561nm -> yellow
         - 638/640nm -> red
-        - 730nm -> magenta
-        - _B suffix -> blue
-        - _G suffix -> green
-        - _R suffix -> red
+        - 730nm -> darkred
         """
-        name_upper = channel_name.upper()
-        
-        # Check for wavelength numbers
-        if '405' in name_upper:
+        if wavelength <= 420:
             return 'blue'
-        elif '488' in name_upper:
+        elif 470 <= wavelength <= 510:
             return 'green'
-        elif '561' in name_upper:
+        elif 540 <= wavelength <= 590:
             return 'yellow'
-        elif '638' in name_upper or '640' in name_upper:
+        elif 620 <= wavelength <= 660:
             return 'red'
-        elif '730' in name_upper:
-            return 'Reds'  # Sequential colormap for far-red/near-infrared
-        # Check for suffix patterns
-        elif name_upper.endswith('_B'):
-            return 'blue'
-        elif name_upper.endswith('_G'):
-            return 'green'
-        elif name_upper.endswith('_R'):
-            return 'red'
-        # Default color based on index
+        elif wavelength >= 700:
+            return 'darkred'
         else:
-            default_colors = ['blue', 'green', 'yellow', 'red', 'Reds']
+            # Default color based on index
+            default_colors = ['blue', 'green', 'yellow', 'red', 'darkred']
             return default_colors[index] if index < len(default_colors) else 'gray'
 
     def set_ndv_data(self, data):
@@ -840,7 +827,8 @@ class TiffViewerWidget(QWidget):
             luts = {}
             for i in range(n_c):
                 name = channel_names[i] if i < len(channel_names) else f'Channel_{i}'
-                luts[i] = self._get_channel_colormap_from_name(name, i)
+                wavelength = extract_wavelength(name)
+                luts[i] = self._get_channel_colormap(wavelength, i)
             
             n_fov = len(all_fovs)
             
@@ -1228,8 +1216,8 @@ class TiffViewerWidget(QWidget):
             
             for i in range(n_channels):
                 name = channel_names[i] if i < len(channel_names) else f'Channel_{i}'
-                colormap = self._get_channel_colormap_from_name(name, i)
-                luts[i] = colormap
+                wavelength = extract_wavelength(name)
+                luts[i] = self._get_channel_colormap(wavelength, i)
             
             bio_img.close()  # ✓ CRITICAL: Close after getting metadata
             
@@ -1329,7 +1317,15 @@ class TiffViewerWidget(QWidget):
             # Extract colormaps from stack metadata
             metadata = self.plate_stack.get_metadata()
             if metadata and 'shape_info' in metadata and metadata['shape_info']:
-                self.wavelengths = metadata['shape_info']['wavelengths']
+                wavelengths = metadata['shape_info']['wavelengths']
+                # Ensure wavelengths are integers (for backward compatibility with old caches)
+                if wavelengths:
+                    if isinstance(wavelengths[0], str):
+                        wavelengths = [extract_wavelength(wl) for wl in wavelengths]
+                    elif not isinstance(wavelengths[0], int):
+                        # Handle any other type by converting to int
+                        wavelengths = [int(wl) if isinstance(wl, (int, float)) else extract_wavelength(str(wl)) for wl in wavelengths]
+                self.wavelengths = wavelengths
                 self.colormaps = metadata['shape_info']['colormaps']
             
             # Update status
